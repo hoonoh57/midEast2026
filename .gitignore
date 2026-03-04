@@ -1,0 +1,30 @@
+# 민감 정보
+.env
+
+# 로그
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
+# VB.NET / Visual Studio
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.vspscc
+*.vssscc
+Thumbs.db
+
+# OS
+.DS_Store
+desktop.ini

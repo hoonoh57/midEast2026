@@ -1,0 +1,1207 @@
+#!/usr/bin/env python3
+"""
+=============================================================================
+ WAR-ADAPTIVE MULTI-CHART TRADING ENGINE v1.0
+ 이란 공습 대응형 실전 자동매매 시스템
+
+ 연동: server32 (localhost:8082) + MySQL (stock_info) + 외부 크롤링
+ 대상: 방산 / 에너지 / 반도체 섹터
+ 날짜: 2026-03-04 즉시 실행용
+=============================================================================
+"""
+
+import os
+import requests
+import json
+import time
+import threading
+import websocket
+import mysql.connector
+import pandas as pd
+import numpy as np
+from datetime import datetime, timedelta
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
+from bs4 import BeautifulSoup
+from enum import Enum
+from dotenv import load_dotenv
+import logging
+
+load_dotenv()
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    handlers=[
+        logging.FileHandler('war_engine.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+log = logging.getLogger('WAR_ENGINE')
+
+# ═══════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════
+
+SERVER_BASE = os.getenv('SERVER_BASE', 'http://localhost:8082')
+WS_REALTIME = os.getenv('WS_REALTIME', 'ws://localhost:8082/ws/realtime')
+WS_EXECUTION = os.getenv('WS_EXECUTION', 'ws://localhost:8082/ws/execution')
+
+MYSQL_CONFIG = {
+    'host': os.getenv('MYSQL_HOST', 'localhost'),
+    'user': os.getenv('MYSQL_USER', 'root'),
+    'password': os.getenv('MYSQL_PASSWORD', ''),
+    'charset': 'utf8mb4',
+}
+
+DB_STOCK_INFO = os.getenv('DB_STOCK_INFO', 'stock_information')
+DB_CANDLES    = os.getenv('DB_CANDLES', 'stock_info')
+
+# ═══════════════════════════════════════════════════════════════
+# DATA CLASSES
+# ═══════════════════════════════════════════════════════════════
+
+class Regime(Enum):
+    EXTREME_CRISIS = "EXTREME_CRISIS"
+    CRISIS = "CRISIS"
+    CAUTIOUS = "CAUTIOUS"
+    RECOVERY = "RECOVERY"
+    AGGRESSIVE = "AGGRESSIVE"
+
+class WarPhase(Enum):
+    SHOCK = "SHOCK"               # D+0~1
+    PANIC_SELLING = "PANIC"       # D+2~3
+    STABILIZATION = "STABLE"      # D+4~7  ★현재
+    EARLY_RECOVERY = "E_RECOVERY" # D+8~14
+    FULL_RECOVERY = "F_RECOVERY"  # D+15+
+
+@dataclass
+class TargetStock:
+    code: str
+    name: str
+    sector: str                   # 'defense' | 'energy' | 'semiconductor'
+    prev_close: int
+    target_price: int             # 증권사 목표가
+    stop_loss_pct: float
+    sector_weight: float          # 섹터 내 비중
+    buy_levels: List[dict] = field(default_factory=list)
+
+@dataclass
+class Signal:
+    code: str
+    name: str
+    action: str                   # BUY | SELL | HOLD
+    price: int
+    quantity: int
+    confidence: float
+    chart: str                    # MACRO | DEFENSE | ENERGY | SEMI
+    reason: str
+    stop_loss: int = 0
+    take_profit: int = 0
+    timestamp: str = ""
+
+# ═══════════════════════════════════════════════════════════════
+# TARGET UNIVERSE — 오늘(3/4) 대응 종목
+# ═══════════════════════════════════════════════════════════════
+
+TARGETS: Dict[str, TargetStock] = {
+    # ── 방산 (35%) ──
+    '012450': TargetStock('012450', '한화에어로스페이스', 'defense',
+                          1432000, 1800000, -0.08, 0.35),
+    '079550': TargetStock('079550', 'LIG넥스원', 'defense',
+                          661000, 710000, -0.08, 0.30),
+    '272210': TargetStock('272210', '한화시스템', 'defense',
+                          146700, 180000, -0.08, 0.20),
+    '064350': TargetStock('064350', '현대로템', 'defense',
+                          249000, 310000, -0.07, 0.15),
+    # ── 에너지 (20%) ──
+    '010950': TargetStock('010950', '에쓰오일', 'energy',
+                          141300, 170000, -0.07, 0.35),
+    '096770': TargetStock('096770', 'SK이노베이션', 'energy',
+                          130000, 160000, -0.07, 0.30),
+    '011200': TargetStock('011200', 'HMM', 'energy',
+                          0, 0, -0.08, 0.20),
+    '028670': TargetStock('028670', '팬오션', 'energy',
+                          0, 0, -0.08, 0.15),
+    # ── 반도체 (30%) — 역발상 분할매수 ──
+    '005930': TargetStock('005930', '삼성전자', 'semiconductor',
+                          195100, 260000, -0.10, 0.55,
+                          buy_levels=[
+                              {'price': 195000, 'pct': 0.15, 'label': 'L1'},
+                              {'price': 188000, 'pct': 0.20, 'label': 'L2'},
+                              {'price': 180000, 'pct': 0.25, 'label': 'L3'},
+                              {'price': 172000, 'pct': 0.25, 'label': 'L4'},
+                              {'price': 165000, 'pct': 0.15, 'label': 'L5'},
+                          ]),
+    '000660': TargetStock('000660', 'SK하이닉스', 'semiconductor',
+                          939000, 1350000, -0.10, 0.45,
+                          buy_levels=[
+                              {'price': 940000, 'pct': 0.15, 'label': 'L1'},
+                              {'price': 900000, 'pct': 0.20, 'label': 'L2'},
+                              {'price': 850000, 'pct': 0.25, 'label': 'L3'},
+                              {'price': 800000, 'pct': 0.25, 'label': 'L4'},
+                              {'price': 750000, 'pct': 0.15, 'label': 'L5'},
+                          ]),
+}
+
+SECTOR_ALLOCATION = {
+    'defense': 0.35,
+    'energy': 0.20,
+    'semiconductor': 0.30,
+    'cash': 0.15,
+}
+
+# ═══════════════════════════════════════════════════════════════
+# SERVER32 API CLIENT
+# ═══════════════════════════════════════════════════════════════
+
+class Server32Client:
+    """server32 REST API 래퍼 — 키움증권 연동"""
+
+    def __init__(self, base_url=SERVER_BASE):
+        self.base = base_url
+        self.account_no = None
+        self.session = requests.Session()
+        self.session.timeout = 10
+
+    def _get(self, path, params=None) -> dict:
+        try:
+            r = self.session.get(f"{self.base}{path}", params=params)
+            data = r.json()
+            if not data.get('Success'):
+                log.warning(f"API 실패: {path} → {data.get('Message')}")
+            return data
+        except Exception as e:
+            log.error(f"API 오류: {path} → {e}")
+            return {'Success': False, 'Message': str(e), 'Data': None}
+
+    def _post(self, path, body) -> dict:
+        try:
+            r = self.session.post(f"{self.base}{path}", json=body)
+            return r.json()
+        except Exception as e:
+            log.error(f"POST 오류: {path} → {e}")
+            return {'Success': False, 'Message': str(e), 'Data': None}
+
+    # ── 인증/상태 ──
+    def login(self) -> bool:
+        res = self._get('/api/auth/login')
+        if res['Success'] and res['Data']:
+            self.account_no = res['Data'].get('account')
+            log.info(f"✅ 로그인 성공: {self.account_no}")
+            return True
+        return False
+
+    def check_status(self) -> dict:
+        return self._get('/api/status')
+
+    # ── 계좌 ──
+    def get_dashboard(self, refresh=False) -> dict:
+        path = '/api/dashboard/refresh' if refresh else '/api/dashboard'
+        return self._get(path)
+
+    def get_balance(self) -> list:
+        res = self._get('/api/accounts/balance', {'accountNo': self.account_no})
+        return res.get('Data', []) if res['Success'] else []
+
+    def get_deposit(self) -> dict:
+        res = self._get('/api/accounts/deposit', {'accountNo': self.account_no})
+        return res.get('Data', [{}])[0] if res['Success'] and res.get('Data') else {}
+
+    def get_outstanding_orders(self) -> list:
+        res = self._get('/api/accounts/orders', {'accountNo': self.account_no})
+        return res.get('Data', []) if res['Success'] else []
+
+    # ── 시세 ──
+    def get_symbol_info(self, code: str) -> dict:
+        res = self._get('/api/market/symbol', {'code': code})
+        return res.get('Data', {}) if res['Success'] else {}
+
+    def get_daily_candles(self, code: str, date: str, stop_date: str) -> list:
+        res = self._get('/api/market/candles/daily', {
+            'code': code, 'date': date, 'stopDate': stop_date
+        })
+        return res.get('Data', []) if res['Success'] else []
+
+    def get_minute_candles(self, code: str, tick: int = 1,
+                           stop_time: str = '20180101090000') -> list:
+        res = self._get('/api/market/candles/minute', {
+            'code': code, 'tick': str(tick), 'stopTime': stop_time
+        })
+        return res.get('Data', []) if res['Success'] else []
+
+    # ── 실시간 ──
+    def subscribe_realtime(self, codes: List[str], screen='1000'):
+        code_str = ';'.join(codes)
+        return self._get('/api/realtime/subscribe', {
+            'codes': code_str, 'screen': screen
+        })
+
+    def unsubscribe_realtime(self, screen='ALL', code='ALL'):
+        return self._get('/api/realtime/unsubscribe', {
+            'screen': screen, 'code': code
+        })
+
+    # ── 주문 ──
+    def send_order(self, code: str, order_type: int, quantity: int,
+                   price: int, quote_type: str = '00') -> dict:
+        """
+        order_type: 1=신규매수, 2=신규매도, 3=매수취소, 4=매도취소
+        quote_type: "00"=지정가, "03"=시장가
+        """
+        body = {
+            "AccountNo": self.account_no,
+            "StockCode": code,
+            "OrderType": order_type,
+            "Quantity": quantity,
+            "Price": price,
+            "QuoteType": quote_type,
+        }
+        log.info(f"📤 주문: {code} {'매수' if order_type==1 else '매도'} "
+                 f"{quantity}주 @ {price:,}원")
+        return self._post('/api/orders', body)
+
+
+# ═══════════════════════════════════════════════════════════════
+# MYSQL CLIENT
+# ═══════════════════════════════════════════════════════════════
+
+class MySQLClient:
+    """MySQL 종목정보 + 일봉 데이터 조회/저장"""
+
+    def __init__(self):
+        self.conn_info = None
+        self.conn_candle = None
+        self._connect()
+
+    def _connect(self):
+        try:
+            self.conn_info = mysql.connector.connect(
+                **MYSQL_CONFIG, database=DB_STOCK_INFO
+            )
+            self.conn_candle = mysql.connector.connect(
+                **MYSQL_CONFIG, database=DB_CANDLES
+            )
+            log.info("✅ MySQL 연결 성공")
+        except Exception as e:
+            log.error(f"MySQL 연결 실패: {e}")
+
+    def get_stock_info(self, code: str) -> dict:
+        cur = self.conn_info.cursor(dictionary=True)
+        cur.execute("""
+            SELECT code, name, market, sector, sector_large, market_cap,
+                   per, pbr, eps, bps, div_yield, foreign_ratio
+            FROM stock_base_info
+            WHERE code = %s AND is_excluded = 0
+        """, (code,))
+        row = cur.fetchone()
+        cur.close()
+        return row or {}
+
+    def get_sector_stocks(self, sector_keyword: str) -> list:
+        cur = self.conn_info.cursor(dictionary=True)
+        cur.execute("""
+            SELECT code, name, market_cap, per, foreign_ratio
+            FROM stock_base_info
+            WHERE (sector LIKE %s OR sector_large LIKE %s)
+              AND is_excluded = 0
+            ORDER BY market_cap DESC
+        """, (f'%{sector_keyword}%', f'%{sector_keyword}%'))
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+
+    def get_daily_candles_df(self, code: str, days: int = 120) -> pd.DataFrame:
+        cur = self.conn_candle.cursor(dictionary=True)
+        cur.execute("""
+            SELECT date, open, high, low, close, volume, change_pct
+            FROM daily_candles
+            WHERE code = %s
+            ORDER BY date DESC
+            LIMIT %s
+        """, (code, days))
+        rows = cur.fetchall()
+        cur.close()
+        if not rows:
+            return pd.DataFrame()
+        df = pd.DataFrame(rows)
+        df['date'] = pd.to_datetime(df['date'])
+        df = df.sort_values('date').reset_index(drop=True)
+        return df
+
+    def save_candle(self, code: str, date: str, o: int, h: int,
+                    l: int, c: int, vol: int, chg: float = None):
+        cur = self.conn_candle.cursor()
+        cur.execute("""
+            INSERT INTO daily_candles (code, date, open, high, low, close, volume, change_pct)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON DUPLICATE KEY UPDATE
+                open=%s, high=%s, low=%s, close=%s, volume=%s, change_pct=%s
+        """, (code, date, o, h, l, c, vol, chg,
+              o, h, l, c, vol, chg))
+        self.conn_candle.commit()
+        cur.close()
+
+
+# ═══════════════════════════════════════════════════════════════
+# EXTERNAL DATA CRAWLERS
+# ═══════════════════════════════════════════════════════════════
+
+class ExternalDataCollector:
+    """외부 데이터 주기적 수집 (5분 간격)"""
+
+    WAR_KEYWORDS_NEGATIVE = ['확전', '지상군', '핵', '호르무즈봉쇄', '추가공습',
+                              '미사일', '사상자', 'NATO']
+    WAR_KEYWORDS_POSITIVE = ['휴전', '협상', '철수', '종전', '봉쇄해제', '평화']
+
+    def __init__(self):
+        self.latest_wti = 80.0
+        self.latest_brent = 83.0
+        self.wti_change_pct = 0.0
+        self.usdkrw = 1466.0
+        self.news_sentiment = 'NEUTRAL'
+        self.kospi_futures_change = 0.0
+        self.nvidia_change = 0.0
+        self.foreign_net_buy = 0
+        self.vkospi = 30.0
+        self.last_update = None
+
+    def update_all(self):
+        log.info("🌐 외부 데이터 수집 시작...")
+        self._fetch_oil_price()
+        self._fetch_exchange_rate()
+        self._fetch_war_news_sentiment()
+        self._fetch_us_market()
+        self.last_update = datetime.now()
+        log.info(f"🌐 수집 완료: WTI=${self.latest_wti:.1f} "
+                 f"환율={self.usdkrw:.0f} 뉴스={self.news_sentiment}")
+
+    def _fetch_oil_price(self):
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            r = requests.get(
+                'https://kr.investing.com/commodities/crude-oil',
+                headers=headers, timeout=5
+            )
+            soup = BeautifulSoup(r.text, 'html.parser')
+            price_el = soup.select_one('[data-test="instrument-price-last"]')
+            if price_el:
+                self.latest_wti = float(price_el.text.replace(',', ''))
+            change_el = soup.select_one('[data-test="instrument-price-change-percent"]')
+            if change_el:
+                self.wti_change_pct = float(change_el.text.replace('%', '').replace('+', '')) / 100
+        except Exception as e:
+            log.warning(f"유가 크롤링 실패: {e}")
+
+    def _fetch_exchange_rate(self):
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            r = requests.get(
+                'https://kr.investing.com/currencies/usd-krw',
+                headers=headers, timeout=5
+            )
+            soup = BeautifulSoup(r.text, 'html.parser')
+            price_el = soup.select_one('[data-test="instrument-price-last"]')
+            if price_el:
+                self.usdkrw = float(price_el.text.replace(',', ''))
+        except Exception as e:
+            log.warning(f"환율 크롤링 실패: {e}")
+
+    def _fetch_war_news_sentiment(self):
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            r = requests.get(
+                'https://search.naver.com/search.naver?where=news&query=이란+전쟁+호르무즈',
+                headers=headers, timeout=5
+            )
+            soup = BeautifulSoup(r.text, 'html.parser')
+            titles = [el.text for el in soup.select('.news_tit')]
+            all_text = ' '.join(titles[:20])
+
+            neg_count = sum(1 for kw in self.WAR_KEYWORDS_NEGATIVE if kw in all_text)
+            pos_count = sum(1 for kw in self.WAR_KEYWORDS_POSITIVE if kw in all_text)
+
+            if pos_count >= 3:
+                self.news_sentiment = 'EXTREME_POS'
+            elif pos_count >= 1:
+                self.news_sentiment = 'POS'
+            elif neg_count >= 4:
+                self.news_sentiment = 'EXTREME_NEG'
+            elif neg_count >= 2:
+                self.news_sentiment = 'NEG'
+            else:
+                self.news_sentiment = 'NEUTRAL'
+        except Exception as e:
+            log.warning(f"뉴스 크롤링 실패: {e}")
+
+    def _fetch_us_market(self):
+        try:
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            r = requests.get(
+                'https://kr.investing.com/equities/nvidia-corp',
+                headers=headers, timeout=5
+            )
+            soup = BeautifulSoup(r.text, 'html.parser')
+            change_el = soup.select_one('[data-test="instrument-price-change-percent"]')
+            if change_el:
+                self.nvidia_change = float(
+                    change_el.text.replace('%', '').replace('+', '')
+                ) / 100
+        except Exception as e:
+            log.warning(f"미국 시장 크롤링 실패: {e}")
+
+    def get_fnguide_fundamentals(self, code: str) -> dict:
+        try:
+            url = (f"https://comp.fnguide.com/SVO2/ASP/SVD_Main.asp"
+                   f"?pGB=1&gicode=A{code}&cID=&MenuYn=Y&ReportGB=&NewMenuID=101&stkGb=701")
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            tables = pd.read_html(url, encoding='utf-8')
+            if len(tables) > 4:
+                snapshot = tables[4]
+                return {
+                    'source': 'fnguide',
+                    'tables_count': len(tables),
+                    'raw_snapshot': snapshot.to_dict() if not snapshot.empty else {}
+                }
+        except Exception as e:
+            log.warning(f"FnGuide 크롤링 실패 ({code}): {e}")
+        return {}
+
+
+# ═══════════════════════════════════════════════════════════════
+# TECHNICAL ANALYSIS MODULE
+# ═══════════════════════════════════════════════════════════════
+
+class TechnicalAnalysis:
+
+    @staticmethod
+    def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0).rolling(period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(period).mean()
+        rs = gain / loss
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def bollinger(series: pd.Series, period=20, std_mult=2.0):
+        mid = series.rolling(period).mean()
+        std = series.rolling(period).std()
+        return mid + std_mult * std, mid, mid - std_mult * std
+
+    @staticmethod
+    def macd(series: pd.Series, fast=12, slow=26, signal=9):
+        ema_f = series.ewm(span=fast).mean()
+        ema_s = series.ewm(span=slow).mean()
+        macd_line = ema_f - ema_s
+        sig_line = macd_line.ewm(span=signal).mean()
+        hist = macd_line - sig_line
+        return macd_line, sig_line, hist
+
+    @staticmethod
+    def vwap(df: pd.DataFrame) -> pd.Series:
+        typical = (df['high'] + df['low'] + df['close']) / 3
+        cum_tp_vol = (typical * df['volume']).cumsum()
+        cum_vol = df['volume'].cumsum()
+        return cum_tp_vol / cum_vol
+
+    @staticmethod
+    def adx(df: pd.DataFrame, period=14) -> pd.Series:
+        high, low, close = df['high'], df['low'], df['close']
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low - close.shift()).abs()
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean()
+        plus_dm = high.diff().clip(lower=0)
+        minus_dm = (-low.diff()).clip(lower=0)
+        pdi = 100 * plus_dm.rolling(period).mean() / atr
+        mdi = 100 * minus_dm.rolling(period).mean() / atr
+        dx = 100 * (pdi - mdi).abs() / (pdi + mdi)
+        return dx.rolling(period).mean()
+
+    @staticmethod
+    def moving_averages(series: pd.Series):
+        return {
+            'ma5': series.rolling(5).mean(),
+            'ma20': series.rolling(20).mean(),
+            'ma60': series.rolling(60).mean(),
+        }
+
+
+# ═══════════════════════════════════════════════════════════════
+# CHART ENGINES
+# ═══════════════════════════════════════════════════════════════
+
+class Chart1_MacroRegime:
+    """
+    CHART 1: 시장 국면 판단 → 나머지 차트의 Beta 조절
+    """
+    HISTORY = {
+        'avg_1day': -0.01, 'avg_1week': +0.031, 'avg_1month': +0.046,
+        'all_1month_positive': True, 'recovery_days': 20,
+    }
+
+    def __init__(self):
+        self.war_start_date = datetime(2026, 2, 28)
+        self.regime = Regime.CRISIS
+        self.beta = 0.5
+
+    @property
+    def war_day_count(self) -> int:
+        return (datetime.now() - self.war_start_date).days
+
+    def evaluate(self, kospi: float, usdkrw: float, wti: float,
+                 vkospi: float, foreign_net: float, news_sent: str) -> Tuple[Regime, float]:
+        score = 0
+
+        drop = (kospi - 6244) / 6244
+        if drop < -0.10:   score -= 3
+        elif drop < -0.07: score -= 1
+        elif drop > -0.03: score += 2
+
+        if usdkrw > 1500:   score -= 2
+        elif usdkrw < 1440: score += 1
+
+        if wti > 90:   score -= 3
+        elif wti > 80: score -= 1
+        else:          score += 1
+
+        if vkospi > 35:   score -= 2
+        elif vkospi < 20: score += 2
+
+        if foreign_net > 10000:    score += 2
+        elif foreign_net > 0:      score += 1
+        elif foreign_net < -30000: score -= 2
+
+        d = self.war_day_count
+        if d <= 2:    score -= 2
+        elif d <= 5:  score -= 1
+        elif d <= 10: score += 1
+        else:         score += 2
+
+        if news_sent == 'EXTREME_POS':  score += 3
+        elif news_sent == 'POS':        score += 1
+        elif news_sent == 'NEG':        score -= 1
+        elif news_sent == 'EXTREME_NEG': score -= 3
+
+        if score <= -6:
+            self.regime, self.beta = Regime.EXTREME_CRISIS, 0.2
+        elif score <= -3:
+            self.regime, self.beta = Regime.CRISIS, 0.5
+        elif score <= 0:
+            self.regime, self.beta = Regime.CAUTIOUS, 0.7
+        elif score <= 4:
+            self.regime, self.beta = Regime.RECOVERY, 1.0
+        else:
+            self.regime, self.beta = Regime.AGGRESSIVE, 1.5
+
+        log.info(f"📊 MACRO: score={score}, regime={self.regime.value}, "
+                 f"beta={self.beta}, war_day={d}")
+        return self.regime, self.beta
+
+    def get_sector_weights(self) -> dict:
+        d = self.war_day_count
+        if d <= 3:
+            return {'defense': 0.40, 'energy': 0.25, 'semiconductor': 0.15, 'cash': 0.20}
+        elif d <= 7:
+            return {'defense': 0.35, 'energy': 0.20, 'semiconductor': 0.30, 'cash': 0.15}
+        elif d <= 14:
+            return {'defense': 0.25, 'energy': 0.15, 'semiconductor': 0.40, 'cash': 0.20}
+        else:
+            return {'defense': 0.20, 'energy': 0.10, 'semiconductor': 0.50, 'cash': 0.20}
+
+
+class Chart2_DefenseScalp:
+    """CHART 2: 방산주 스캘핑/스윙"""
+
+    def __init__(self, ta: TechnicalAnalysis):
+        self.ta = ta
+
+    def generate_signal(self, code: str, minute_df: pd.DataFrame,
+                        daily_df: pd.DataFrame, beta: float,
+                        current_price: int) -> Optional[Signal]:
+        if minute_df.empty or len(minute_df) < 20:
+            return None
+
+        target = TARGETS.get(code)
+        if not target or target.sector != 'defense':
+            return None
+
+        rsi_val = self.ta.rsi(minute_df['close'], 9).iloc[-1]
+        bb_u, bb_m, bb_l = self.ta.bollinger(minute_df['close'], 20, 2.0)
+        vwap_val = self.ta.vwap(minute_df).iloc[-1]
+        vol_mean = minute_df['volume'].rolling(20).mean().iloc[-1]
+        vol_ratio = (minute_df['volume'].iloc[-1] / vol_mean) if vol_mean > 0 else 1
+
+        buy_score = sum([
+            current_price >= vwap_val * 0.995,
+            current_price <= vwap_val * 1.02,
+            rsi_val < 40,
+            current_price > bb_l.iloc[-1],
+            vol_ratio > 1.5,
+        ])
+
+        if buy_score >= 4:
+            qty = max(1, int(100_000_000 * target.sector_weight *
+                             SECTOR_ALLOCATION['defense'] * beta / current_price))
+            return Signal(
+                code=code, name=target.name, action='BUY',
+                price=current_price, quantity=qty,
+                confidence=min(buy_score / 5 * 100, 95),
+                chart='DEFENSE', reason=f'VWAP지지+RSI({rsi_val:.0f})+거래량({vol_ratio:.1f}x)',
+                stop_loss=int(current_price * (1 + target.stop_loss_pct)),
+                take_profit=int(current_price * 1.05),
+            )
+
+        if rsi_val > 78 or current_price > bb_u.iloc[-1] * 0.98:
+            return Signal(
+                code=code, name=target.name, action='SELL',
+                price=current_price, quantity=0,
+                confidence=80, chart='DEFENSE',
+                reason=f'RSI과매수({rsi_val:.0f}) 또는 BB상단 근접',
+            )
+
+        return None
+
+
+class Chart3_EnergyOil:
+    """CHART 3: 에너지 섹터 — 유가 연동"""
+
+    def __init__(self, ta: TechnicalAnalysis):
+        self.ta = ta
+
+    def generate_signal(self, code: str, minute_df: pd.DataFrame,
+                        wti: float, wti_change: float, beta: float,
+                        current_price: int, news_sent: str) -> Optional[Signal]:
+        target = TARGETS.get(code)
+        if not target or target.sector != 'energy':
+            return None
+        if minute_df.empty or len(minute_df) < 10:
+            return None
+
+        rsi_val = self.ta.rsi(minute_df['close'], 9).iloc[-1]
+
+        if news_sent in ('POS', 'EXTREME_POS'):
+            return Signal(
+                code=code, name=target.name, action='SELL',
+                price=current_price, quantity=0, confidence=90,
+                chart='ENERGY', reason=f'휴전뉴스감지→에너지즉시청산',
+            )
+
+        if wti_change > 0.02 and rsi_val < 70:
+            qty = max(1, int(100_000_000 * target.sector_weight *
+                             SECTOR_ALLOCATION['energy'] * beta / max(current_price, 1)))
+            return Signal(
+                code=code, name=target.name, action='BUY',
+                price=current_price, quantity=qty,
+                confidence=min(70 + wti_change * 500, 95),
+                chart='ENERGY', reason=f'WTI+{wti_change*100:.1f}% RSI={rsi_val:.0f}',
+                stop_loss=int(current_price * 0.95),
+                take_profit=int(current_price * (1 + wti_change * 2.5)),
+            )
+
+        if wti_change < -0.015 or rsi_val > 80:
+            return Signal(
+                code=code, name=target.name, action='SELL',
+                price=current_price, quantity=0, confidence=75,
+                chart='ENERGY', reason=f'유가반전({wti_change*100:.1f}%) or RSI({rsi_val:.0f})',
+            )
+
+        return None
+
+
+class Chart4_SemiContrarian:
+    """CHART 4: 반도체 역발상 분할매수"""
+
+    def __init__(self, ta: TechnicalAnalysis):
+        self.ta = ta
+        self.filled_levels: Dict[str, set] = {
+            '005930': set(), '000660': set()
+        }
+
+    def generate_signals(self, code: str, daily_df: pd.DataFrame,
+                         current_price: int, beta: float,
+                         war_day: int, nvidia_chg: float) -> List[Signal]:
+        target = TARGETS.get(code)
+        if not target or target.sector != 'semiconductor':
+            return []
+        if not target.buy_levels:
+            return []
+
+        signals = []
+
+        for level in target.buy_levels:
+            lid = level['label']
+            if lid in self.filled_levels.get(code, set()):
+                continue
+
+            if current_price <= level['price']:
+                war_mult = 1.0
+                if war_day >= 3: war_mult = 1.2
+                if war_day >= 7: war_mult = 1.5
+                nv_boost = 1.3 if nvidia_chg > 0.02 else 1.0
+
+                size = (level['pct'] * target.sector_weight *
+                        SECTOR_ALLOCATION['semiconductor'] * beta * war_mult * nv_boost)
+                qty = max(1, int(100_000_000 * size / max(current_price, 1)))
+
+                signals.append(Signal(
+                    code=code, name=target.name, action='BUY',
+                    price=current_price, quantity=qty,
+                    confidence=70 + war_day * 2 + (10 if nvidia_chg > 0 else 0),
+                    chart='SEMI',
+                    reason=(f'{lid}도달({current_price:,}≤{level["price"]:,}) '
+                            f'war_d{war_day} nv={nvidia_chg*100:+.1f}%'),
+                    stop_loss=int(level['price'] * 0.92),
+                    take_profit=target.target_price,
+                ))
+                self.filled_levels[code].add(lid)
+
+        pre_war_high = {'005930': 216500, '000660': 1061000}.get(code, 0)
+        if current_price >= pre_war_high * 0.98 and pre_war_high > 0:
+            signals.append(Signal(
+                code=code, name=target.name, action='SELL',
+                price=current_price, quantity=0,
+                confidence=85, chart='SEMI',
+                reason=f'전고점({pre_war_high:,}) 근접→50%익절',
+            ))
+
+        return signals
+
+
+# ═══════════════════════════════════════════════════════════════
+# REALTIME WEBSOCKET HANDLER
+# ═══════════════════════════════════════════════════════════════
+
+class RealtimeHandler:
+
+    def __init__(self, on_tick_callback):
+        self.on_tick = on_tick_callback
+        self.ws = None
+        self.prices: Dict[str, int] = {}
+        self.minute_buffers: Dict[str, List[dict]] = {}
+        self._running = False
+
+    def start(self):
+        self._running = True
+        t = threading.Thread(target=self._connect, daemon=True)
+        t.start()
+
+    def stop(self):
+        self._running = False
+        if self.ws:
+            self.ws.close()
+
+    def _connect(self):
+        def on_message(ws, msg):
+            try:
+                data = json.loads(msg)
+                msg_type = data.get('type', '')
+                code = data.get('code', '')
+
+                if msg_type == 'tick' and code:
+                    tick = data.get('data', {})
+                    price = int(str(tick.get('current_price', '0')).lstrip('-+'))
+                    volume = int(str(tick.get('volume', '0')))
+
+                    self.prices[code] = price
+                    self._update_minute_buffer(code, price, volume, tick)
+                    self.on_tick(code, price, volume, tick)
+
+            except Exception as e:
+                log.debug(f"WS parse error: {e}")
+
+        def on_error(ws, error):
+            log.warning(f"WS error: {error}")
+
+        def on_close(ws, code, reason):
+            log.info(f"WS closed: {code} {reason}")
+            if self._running:
+                time.sleep(3)
+                self._connect()
+
+        self.ws = websocket.WebSocketApp(
+            WS_REALTIME,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+        )
+        self.ws.run_forever()
+
+    def _update_minute_buffer(self, code, price, volume, tick):
+        if code not in self.minute_buffers:
+            self.minute_buffers[code] = []
+        now = datetime.now()
+        minute_key = now.strftime('%Y%m%d%H%M')
+
+        buf = self.minute_buffers[code]
+        if buf and buf[-1].get('_key') == minute_key:
+            bar = buf[-1]
+            bar['high'] = max(bar['high'], price)
+            bar['low'] = min(bar['low'], price)
+            bar['close'] = price
+            bar['volume'] += volume
+        else:
+            buf.append({
+                '_key': minute_key,
+                'time': now,
+                'open': price, 'high': price,
+                'low': price, 'close': price,
+                'volume': volume,
+            })
+            if len(buf) > 200:
+                buf.pop(0)
+
+    def get_minute_df(self, code: str) -> pd.DataFrame:
+        buf = self.minute_buffers.get(code, [])
+        if not buf:
+            return pd.DataFrame()
+        df = pd.DataFrame(buf)
+        return df[['time', 'open', 'high', 'low', 'close', 'volume']]
+
+
+# ═══════════════════════════════════════════════════════════════
+# RISK MANAGER
+# ═══════════════════════════════════════════════════════════════
+
+class RiskManager:
+
+    MAX_SINGLE_POSITION = 0.15
+    MAX_DAILY_LOSS = -0.05
+    MAX_DRAWDOWN = -0.12
+    MIN_CASH = 0.10
+
+    def __init__(self, total_capital: int):
+        self.total_capital = total_capital
+        self.daily_pnl = 0
+        self.max_equity = total_capital
+
+    def can_buy(self, signal: Signal, current_holdings: list) -> bool:
+        if self.daily_pnl / self.total_capital < self.MAX_DAILY_LOSS:
+            log.warning(f"⛔ 일일 손실 한도 초과 → 매수 차단")
+            return False
+
+        equity = self.total_capital + self.daily_pnl
+        dd = (equity - self.max_equity) / self.max_equity
+        if dd < self.MAX_DRAWDOWN:
+            log.warning(f"⛔ 총 낙폭 한도({dd*100:.1f}%) 초과 → 전면 매매 중단")
+            return False
+
+        return True
+
+    def adjust_quantity(self, signal: Signal) -> int:
+        max_amount = self.total_capital * self.MAX_SINGLE_POSITION
+        if signal.price > 0:
+            max_qty = int(max_amount / signal.price)
+            return min(signal.quantity, max_qty)
+        return signal.quantity
+
+
+# ═══════════════════════════════════════════════════════════════
+# ORDER EXECUTOR
+# ═══════════════════════════════════════════════════════════════
+
+class OrderExecutor:
+
+    def __init__(self, api: Server32Client, risk: RiskManager):
+        self.api = api
+        self.risk = risk
+        self.pending_signals: List[Signal] = []
+        self.executed_orders: List[dict] = []
+
+    def process_signal(self, signal: Signal, holdings: list):
+        if signal.action == 'HOLD':
+            return
+
+        signal.timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+
+        if signal.action == 'BUY':
+            if not self.risk.can_buy(signal, holdings):
+                return
+            qty = self.risk.adjust_quantity(signal)
+            if qty <= 0:
+                return
+
+            log.info(f"🟢 매수실행: {signal.name}({signal.code}) "
+                     f"{qty}주 @ {signal.price:,}원 [{signal.chart}] "
+                     f"이유: {signal.reason}")
+
+            result = self.api.send_order(
+                code=signal.code,
+                order_type=1,
+                quantity=qty,
+                price=signal.price,
+                quote_type='00',
+            )
+            self.executed_orders.append({
+                'signal': signal, 'result': result, 'time': signal.timestamp
+            })
+
+        elif signal.action == 'SELL':
+            held_qty = 0
+            for h in holdings:
+                if h.get('종목코드', '').strip() == signal.code:
+                    held_qty = int(h.get('보유수량', '0'))
+                    break
+
+            sell_qty = held_qty if signal.quantity == 0 else min(signal.quantity, held_qty)
+            if sell_qty <= 0:
+                return
+
+            log.info(f"🔴 매도실행: {signal.name}({signal.code}) "
+                     f"{sell_qty}주 @ 시장가 [{signal.chart}] "
+                     f"이유: {signal.reason}")
+
+            result = self.api.send_order(
+                code=signal.code,
+                order_type=2,
+                quantity=sell_qty,
+                price=0,
+                quote_type='03',
+            )
+            self.executed_orders.append({
+                'signal': signal, 'result': result, 'time': signal.timestamp
+            })
+
+
+# ═══════════════════════════════════════════════════════════════
+# EXECUTION WEBSOCKET
+# ═══════════════════════════════════════════════════════════════
+
+class ExecutionHandler:
+
+    def __init__(self, on_execution_callback):
+        self.on_exec = on_execution_callback
+        self.ws = None
+
+    def start(self):
+        t = threading.Thread(target=self._connect, daemon=True)
+        t.start()
+
+    def _connect(self):
+        def on_message(ws, msg):
+            try:
+                data = json.loads(msg)
+                self.on_exec(data)
+            except:
+                pass
+
+        self.ws = websocket.WebSocketApp(
+            WS_EXECUTION,
+            on_message=on_message,
+        )
+        self.ws.run_forever()
+
+
+# ═══════════════════════════════════════════════════════════════
+# MASTER ENGINE
+# ═══════════════════════════════════════════════════════════════
+
+class WarAdaptiveEngine:
+    """
+    WAR-ADAPTIVE MULTI-CHART TRADING ENGINE
+    이란 공습 대응형 실전 자동매매 마스터 엔진
+    server32 + MySQL + 외부크롤링 + 4차트 통합
+    """
+
+    TOTAL_CAPITAL = 100_000_000  # 1억원
+    CYCLE_INTERVAL = 60
+    EXTERNAL_INTERVAL = 300
+
+    def __init__(self):
+        log.info("=" * 60)
+        log.info("  WAR-ADAPTIVE ENGINE 초기화 시작")
+        log.info("=" * 60)
+
+        self.api = Server32Client()
+        self.db = MySQLClient()
+        self.ext = ExternalDataCollector()
+        self.ta = TechnicalAnalysis()
+        self.risk = RiskManager(self.TOTAL_CAPITAL)
+        self.executor = OrderExecutor(self.api, self.risk)
+
+        self.chart1 = Chart1_MacroRegime()
+        self.chart2 = Chart2_DefenseScalp(self.ta)
+        self.chart3 = Chart3_EnergyOil(self.ta)
+        self.chart4 = Chart4_SemiContrarian(self.ta)
+
+        self.rt = RealtimeHandler(on_tick_callback=self._on_tick)
+        self.exec_handler = ExecutionHandler(on_execution_callback=self._on_execution)
+
+        self._last_external_update = datetime.min
+        self._cycle_count = 0
+        self._running = False
+
+    def initialize(self) -> bool:
+        if not self.api.login():
+            log.error("❌ 로그인 실패 — 서버 확인 필요")
+            return False
+
+        status = self.api.check_status()
+        if not status.get('Data', {}).get('IsLoggedIn'):
+            log.error("❌ 세션 미확인")
+            return False
+
+        dash = self.api.get_dashboard(refresh=True)
+        deposit = self.api.get_deposit()
+        log.info(f"💰 계좌: {self.api.account_no}")
+        log.info(f"💰 예수금: {deposit}")
+
+        for code, target in TARGETS.items():
+            info = self.db.get_stock_info(code)
+            if info:
+                log.info(f"  📌 {target.name} ({code}): "
+                         f"시총={info.get('market_cap', 0)/100_000_000:.0f}억 "
+                         f"PER={info.get('per', 0):.1f}")
+            if target.prev_close == 0:
+                sym = self.api.get_symbol_info(code)
+                if sym:
+                    target.prev_close = int(sym.get('last_price', 0))
+
+        self.ext.update_all()
+
+        self.rt.start()
+        self.exec_handler.start()
+        time.sleep(1)
+
+        all_codes = list(TARGETS.keys())
+        self.api.subscribe_realtime(all_codes, screen='1000')
+        log.info(f"📡 실시간 구독: {len(all_codes)}종목")
+
+        log.info("✅ 초기화 완료 — 엔진 가동 준비")
+        return True
+
+    def _on_tick(self, code: str, price: int, volume: int, raw: dict):
+        pass
+
+    def _on_execution(self, data: dict):
+        msg_type = data.get('type', '')
+        if msg_type == 'order':
+            log.info(f"✅ 체결알림: {json.dumps(data.get('data', {}), ensure_ascii=False)[:200]}")
+
+    def run(self):
+        self._running = True
+        log.info("🚀 메인 루프 시작")
+
+        while self._running:
+            try:
+                self._cycle_count += 1
+                cycle_start = time.time()
+
+                if (datetime.now() - self._last_external_update).seconds > self.EXTERNAL_INTERVAL:
+                    self.ext.update_all()
+                    self._last_external_update = datetime.now()
+
+                kospi_price = self.rt.prices.get('KOSPI', 5792)
+                regime, beta = self.chart1.evaluate(
+                    kospi=kospi_price,
+                    usdkrw=self.ext.usdkrw,
+                    wti=self.ext.latest_wti,
+                    vkospi=self.ext.vkospi,
+                    foreign_net=self.ext.foreign_net_buy,
+                    news_sent=self.ext.news_sentiment,
+                )
+
+                holdings = self.api.get_balance()
+                all_signals: List[Signal] = []
+
+                for code, target in TARGETS.items():
+                    price = self.rt.prices.get(code, target.prev_close)
+                    if price <= 0:
+                        continue
+
+                    min_df = self.rt.get_minute_df(code)
+                    if len(min_df) < 20:
+                        raw = self.api.get_minute_candles(code, tick=5)
+                        if raw:
+                            min_df = self._parse_minute_candles(raw)
+
+                    daily_df = self.db.get_daily_candles_df(code, days=60)
+
+                    if target.sector == 'defense':
+                        sig = self.chart2.generate_signal(
+                            code, min_df, daily_df, beta, price
+                        )
+                        if sig:
+                            all_signals.append(sig)
+
+                    elif target.sector == 'energy':
+                        sig = self.chart3.generate_signal(
+                            code, min_df, self.ext.latest_wti,
+                            self.ext.wti_change_pct, beta, price,
+                            self.ext.news_sentiment,
+                        )
+                        if sig:
+                            all_signals.append(sig)
+
+                    elif target.sector == 'semiconductor':
+                        sigs = self.chart4.generate_signals(
+                            code, daily_df, price, beta,
+                            self.chart1.war_day_count,
+                            self.ext.nvidia_change,
+                        )
+                        all_signals.extend(sigs)
+
+                for sig in all_signals:
+                    self.executor.process_signal(sig, holdings)
+
+                elapsed = time.time() - cycle_start
+                if self._cycle_count % 5 == 0:
+                    log.info(
+                        f"─── Cycle #{self._cycle_count} ({elapsed:.1f}s) ───\n"
+                        f"  Regime: {regime.value} | Beta: {beta:.2f}\n"
+                        f"  WTI: ${self.ext.latest_wti:.1f} ({self.ext.wti_change_pct*100:+.1f}%)\n"
+                        f"  환율: {self.ext.usdkrw:.0f}원\n"
+                        f"  뉴스: {self.ext.news_sentiment}\n"
+                        f"  전쟁: D+{self.chart1.war_day_count}\n"
+                        f"  시그널: {len(all_signals)}건\n"
+                        f"  종목가: {dict(list(self.rt.prices.items())[:5])}"
+                    )
+
+                sleep_time = max(0, self.CYCLE_INTERVAL - elapsed)
+                time.sleep(sleep_time)
+
+            except KeyboardInterrupt:
+                log.info("⚠️ 사용자 중단")
+                break
+            except Exception as e:
+                log.error(f"메인루프 오류: {e}", exc_info=True)
+                time.sleep(5)
+
+        self.shutdown()
+
+    def _parse_minute_candles(self, raw: list) -> pd.DataFrame:
+        rows = []
+        for r in raw:
+            rows.append({
+                'time': pd.to_datetime(str(r.get('체결시간', '')), format='%Y%m%d%H%M%S', errors='coerce'),
+                'open': abs(int(r.get('시가', 0))),
+                'high': abs(int(r.get('고가', 0))),
+                'low': abs(int(r.get('저가', 0))),
+                'close': abs(int(r.get('현재가', 0))),
+                'volume': abs(int(r.get('거래량', 0))),
+            })
+        df = pd.DataFrame(rows)
+        if not df.empty:
+            df = df.sort_values('time').reset_index(drop=True)
+        return df
+
+    def shutdown(self):
+        log.info("🛑 엔진 종료 시작...")
+        self._running = False
+        self.api.unsubscribe_realtime()
+        self.rt.stop()
+        log.info("🛑 엔진 종료 완료")
+
+
+# ═══════════════════════════════════════════════════════════════
+# ENTRY POINT
+# ═══════════════════════════════════════════════════════════════
+
+if __name__ == '__main__':
+    engine = WarAdaptiveEngine()
+    if engine.initialize():
+        engine.run()
+    else:
+        log.error("초기화 실패 — 종료")

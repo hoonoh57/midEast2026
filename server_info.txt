@@ -1,0 +1,763 @@
+
+server 정보
+
+  - github:
+    https://github.com/hoonoh57/server32
+    
+
+
+================================================================================================================
+ KIWOOM / CYBOS FULL MANUAL (CONSOLE)
+================================================================================================================
+Base URL            : http://localhost:8082
+Realtime WS         : ws://localhost:8082/ws/realtime
+Execution WS        : ws://localhost:8082/ws/execution
+Interactive Help    : http://localhost:8082/help
+Machine JSON Manual : http://localhost:8082/api/help
+
+[0] Global Rules
+  - Every REST response envelope:
+    { "Success": bool, "Message": string, "Data": object|array|null }
+  - Parser order: Success -> Message -> Data
+  - If Success=false: treat Message as error reason; Data may be null
+  - Key principle: implement parser by endpoint Data contract below
+
+[1] WebSocket Contracts
+  A) Realtime stream
+     connect: ws://localhost:8082/ws/realtime
+     subscribe trigger: http://localhost:8082/api/realtime/subscribe?codes=005930;000660&screen=1000
+     payload: { "type": "tick|hoga|condition", "code": string, "timestamp": "yyyyMMddHHmmss", "data": object }
+     tick data typical keys: time,current_price,diff,rate,volume,cum_volume,open,high,low,intensity
+     hoga data typical keys: total_ask_vol,total_bid_vol,ask_price_1..5,ask_vol_1..5,bid_price_1..5,bid_vol_1..5
+     condition data keys    : condition_name, condition_index, state(enter|exit)
+  B) Execution stream
+     connect: ws://localhost:8082/ws/execution
+     payload: { "type": "order|balance|dashboard", "timestamp": "yyyyMMddHHmmss", "data": object }
+     order/balance data: chejan fid-key dictionary strings
+     dashboard data   : AccountSnapshot object
+     stop realtime reg: http://localhost:8082/api/realtime/unsubscribe?screen=1000&code=ALL
+
+[2] REST Endpoint Contracts (All)
+  The following list is intended as a complete integration contract.
+
+  [01] GET http://localhost:8082/api/status
+       key            : status
+       purpose        : Get login/session status
+       required query : none
+       optional query : none
+       data contract  : { IsLoggedIn:Boolean, AccountNo:String, ServerName:String }
+       sample success : { Success:true, Data:{ IsLoggedIn:true, AccountNo:'8118057011', ServerName:'...' } }
+       notes          : Use as health-check before all other requests
+
+  [02] GET http://localhost:8082/api/auth/login
+       key            : auth_login
+       purpose        : Trigger Kiwoom login
+       required query : none
+       optional query : none
+       data contract  : { loggedIn:Boolean, account:String }
+       sample success : { Success:true, Data:{ loggedIn:true, account:'8118057011' } }
+       notes          : Equivalent route exists: /api/system/login
+
+  [03] GET http://localhost:8082/api/system/status
+       key            : system_status
+       purpose        : Status alias
+       required query : none
+       optional query : none
+       data contract  : same as /api/status
+       sample success : { Success:true, Data:{ IsLoggedIn:true,... } }
+       notes          : Use one of status routes consistently
+
+  [04] GET http://localhost:8082/api/conditions
+       key            : conditions_load
+       purpose        : Load condition formula list
+       required query : none
+       optional query : none
+       data contract  : Data = ConditionInfo[] where ConditionInfo={ Index:Int32, Name:String }
+       sample success : { Success:true, Data:[{ Index:22, Name:'가치투자-배지고려함' }, ...] }
+       notes          : Client should cache Index+Name mapping
+
+  [05] GET http://localhost:8082/api/conditions/search?name={name}&index={index}
+       key            : conditions_search
+       purpose        : Execute one condition and get matched codes/details
+       required query : name,index
+       optional query : none
+       data contract  : Data={ Codes:String[], Stocks:Object[] }
+       sample success : { Success:true, Data:{ Codes:['005930','000660'], Stocks:[{ '종목코드':'005930', ...}] } }
+       notes          : Stocks field keys follow broker TR output; parse as dictionary/object
+
+  [06] GET http://localhost:8082/api/conditions/start?name={name}&index={index}&screen=9001
+       key            : conditions_stream_start
+       purpose        : Start condition realtime stream
+       required query : name,index
+       optional query : screen(default=9001)
+       data contract  : Data=null
+       sample success : { Success:true, Message:'Condition stream started: ...' }
+       notes          : Realtime events delivered on /ws/realtime with type='condition'
+
+  [07] GET http://localhost:8082/api/conditions/stop?name={name}&index={index}&screen=9001
+       key            : conditions_stream_stop
+       purpose        : Stop condition realtime stream
+       required query : name,index
+       optional query : screen(default=9001)
+       data contract  : Data=null
+       sample success : { Success:true, Message:'Condition stream stopped: ...' }
+       notes          : Stop when strategy unsubscribes
+
+  [08] GET http://localhost:8082/api/dashboard
+       key            : dashboard_cached
+       purpose        : Get cached account dashboard snapshot
+       required query : none
+       optional query : none
+       data contract  : AccountSnapshot object
+       sample success : { Success:true, Data:{ AccountNo:'...', Holdings:[...], Outstanding:[...] } }
+       notes          : Can return 404-like error if snapshot not ready
+
+  [09] GET http://localhost:8082/api/dashboard/refresh
+       key            : dashboard_refresh
+       purpose        : Force refresh account dashboard
+       required query : none
+       optional query : none
+       data contract  : AccountSnapshot object
+       sample success : { Success:true, Data:{ TotalPurchase:..., TotalEvaluation:... } }
+       notes          : Requires logged-in account
+
+  [10] GET http://localhost:8082/api/accounts/balance?accountNo={acc}&pass={pw}
+       key            : accounts_balance
+       purpose        : Query holdings rows
+       required query : accountNo
+       optional query : pass(uses config default when empty)
+       data contract  : Data=Array<Dictionary<String,String>>
+       sample success : { Success:true, Data:[{ '종목코드':'005930', '보유수량':'10', ...}] }
+       notes          : Field names are broker TR keys; parse as map
+
+  [11] GET http://localhost:8082/api/accounts/deposit?accountNo={acc}&pass={pw}
+       key            : accounts_deposit
+       purpose        : Query deposit rows
+       required query : accountNo
+       optional query : pass
+       data contract  : Data=Array<Dictionary<String,String>>
+       sample success : { Success:true, Data:[{ '주문가능금액':'...', ...}] }
+       notes          : Parse needed keys by your account dashboard logic
+
+  [12] GET http://localhost:8082/api/accounts/orders?accountNo={acc}&code={optional}
+       key            : accounts_orders
+       purpose        : Query outstanding orders
+       required query : accountNo
+       optional query : code
+       data contract  : Data=Array<Dictionary<String,String>>
+       sample success : { Success:true, Data:[{ '주문번호':'...', '미체결수량':'...', ...}] }
+       notes          : When code omitted, returns all symbols
+
+  [13] GET http://localhost:8082/api/market/candles/daily?code={code}&date=yyyyMMdd&stopDate=yyyyMMdd
+       key            : candles_daily
+       purpose        : Daily candle history
+       required query : code,date,stopDate
+       optional query : none
+       data contract  : Data=Array<CandleRowMap>
+       sample success : { Success:true, Data:[{ '일자':'20260209','시가':'...','고가':'...','저가':'...','현재가':'...','거래량':'...' }] }
+       notes          : For 900 rows, widen date range by older stopDate
+
+  [14] GET http://localhost:8082/api/market/candles/minute?code={code}&tick=1&stopTime=yyyyMMddHHmmss
+       key            : candles_minute
+       purpose        : Minute candle history
+       required query : code,tick,stopTime
+       optional query : none
+       data contract  : Data=Array<CandleRowMap>
+       sample success : { Success:true, Data:[{ '체결시간':'20260209152000','시가':'...','고가':'...','저가':'...','현재가':'...','거래량':'...' }] }
+       notes          : tick parameter = minute unit (1,3,5...)
+
+  [15] GET http://localhost:8082/api/market/candles/tick?code={code}&tick=60&stopTime=yyyyMMddHHmmss
+       key            : candles_tick
+       purpose        : Tick candle history
+       required query : code,tick,stopTime
+       optional query : none
+       data contract  : Data=Array<CandleRowMap>
+       sample success : { Success:true, Data:[{ '체결시간':'20260220153000','시가':'...','고가':'...','저가':'...','현재가':'...','거래량':'...' }] }
+       notes          : tick parameter = tick interval
+
+  [16] GET http://localhost:8082/api/market/symbol?code={code}
+       key            : market_symbol
+       purpose        : Master symbol metadata
+       required query : code
+       optional query : none
+       data contract  : Data={ code:String, name:String, last_price:Int32, state:String }
+       sample success : { Success:true, Data:{ code:'005930', name:'삼성전자', last_price:70000, state:'...' } }
+       notes          : Good for validation before candle/order
+
+  [17] GET http://localhost:8082/api/realtime/subscribe?codes={005930;000660}&screen=1000&fids={...}
+       key            : rt_subscribe
+       purpose        : Register realtime symbols
+       required query : codes
+       optional query : screen(default=1000), fids(default server set)
+       data contract  : Data=null
+       sample success : { Success:true, Message:'Subscribed: 005930;000660', Data:null }
+       notes          : Open /ws/realtime before/after; events start when broker feed arrives
+
+  [18] GET http://localhost:8082/api/realtime/unsubscribe?screen=1000&code=ALL
+       key            : rt_unsubscribe
+       purpose        : Remove realtime registration
+       required query : none
+       optional query : screen(default=ALL), code(default=ALL)
+       data contract  : Data={ screen:String, code:String }
+       sample success : { Success:true, Message:'Realtime unsubscribed', Data:{ screen:'1000', code:'ALL' } }
+       notes          : Use before reconnect / shutdown
+
+  [19] POST http://localhost:8082/api/orders
+       key            : orders_post
+       purpose        : Send order
+       required query : JSON body: AccountNo, StockCode, OrderType, Quantity, Price, QuoteType
+       optional query : none
+       data contract  : Data varies by broker return
+       sample success : { Success:true, Message:'Order Sent', Data:'Order Sent' }
+       notes          : Execution details are pushed via /ws/execution
+
+[3] High-Value Ready-Made Checks
+  A) 000660 candle volume check (target >= 900)
+     - http://localhost:8082/api/market/candles/daily?code=000660&date=20260209&stopDate=20180101
+     - http://localhost:8082/api/market/candles/minute?code=000660&tick=1&stopTime=20180101090000
+     - http://localhost:8082/api/market/candles/tick?code=000660&tick=1&stopTime=20180101090000
+     - pass rule: Success=true and Data.Count >= 900
+          - daily  header ==>  일자: 20260209, 시가:898000,고가:899000,저가:873000,현재가:887000,종가:887000,거래량:4228584
+          - minute and tick header  ==> 체결시간:20260220153000,시가:949000,고가:949000,저가:949000,현재가:949000,거래량:427640
+  B) condition flow check
+     - http://localhost:8082/api/conditions
+     - http://localhost:8082/api/conditions/search?name={NameFromList}&index={IndexFromList}
+     - pass rule: Data.Codes exists and Data.Stocks exists
+
+[4] Order Request Body Contract
+  POST http://localhost:8082/api/orders
+  {
+    "AccountNo": "1234567890",   // string
+    "StockCode": "005930",      // string
+    "OrderType": 1,              // int
+    "Quantity": 1,               // int
+    "Price": 70000,             // int
+    "QuoteType": "00"          // string
+  }
+
+[5] Cybos Reference
+  - connection check : Cybos.IsCybosConnected()
+  - candle request   : Cybos.DownloadCandlesByPeriod(code,timeframe,fromDate,toDate)
+  - timeframe ex     : m1, m3, T1, D1
+  - date format      : yyyyMMdd or yyyyMMddHHmm
+
+[6] Minimal Production Integration Sequence
+  1) GET /api/auth/login
+  2) GET /api/status (must be IsLoggedIn=true)
+  3) REST data pull endpoints as needed
+  4) open /ws/realtime, then call /api/realtime/subscribe
+  5) parse realtime by type field
+  6) call /api/realtime/unsubscribe before shutdown
+================================================================================================================
+
+mysql 연결정보: 
+
+1) 종목정보: stock_information db
+
+  1) 종목정보:
+use stock_information ;
+CREATE TABLE `stock_base_info` (
+  `code` varchar(6) NOT NULL,
+  `name` varchar(50) DEFAULT NULL,
+  `market` varchar(10) DEFAULT NULL COMMENT 'KOSPI / KOSDAQ',
+  `instrument_type` varchar(10) DEFAULT 'stock',
+  `listing_date` date DEFAULT NULL,
+  `sector` varchar(40) DEFAULT NULL COMMENT 'WICS 중분류',
+  `sector_large` varchar(30) DEFAULT NULL COMMENT 'WICS 대분류',
+  `sector_role` varchar(10) DEFAULT NULL COMMENT 'LEADER / NULL',
+  `market_cap` bigint DEFAULT '0',
+  `listed_shares` bigint DEFAULT '0',
+  `free_float_ratio` float DEFAULT NULL,
+  `foreign_shares` bigint DEFAULT '0',
+  `foreign_limit_shares` bigint DEFAULT '0',
+  `foreign_ratio` float DEFAULT '0',
+  `foreign_limit_ratio` float DEFAULT '0',
+  `per` float DEFAULT '0',
+  `pbr` float DEFAULT '0',
+  `eps` float DEFAULT '0',
+  `bps` float DEFAULT '0',
+  `div_yield` float DEFAULT '0',
+  `dps` float DEFAULT '0',
+  `is_common_stock` tinyint(1) DEFAULT '1',
+  `is_trading_halt` tinyint(1) DEFAULT '0',
+  `is_management` tinyint(1) DEFAULT '0',
+  `is_caution_alert` tinyint(1) DEFAULT '0',
+  `is_invest_warning` tinyint(1) DEFAULT '0',
+  `is_invest_danger` tinyint(1) DEFAULT '0',
+  `is_short_term_overheat` tinyint(1) DEFAULT '0',
+  `is_liquidation` tinyint(1) DEFAULT '0',
+  `is_short_history` tinyint(1) DEFAULT '0',
+  `is_restricted` tinyint(1) DEFAULT '0' COMMENT 'OR(제재플래그)',
+  `is_excluded` tinyint(1) DEFAULT '0' COMMENT '최종 제외 여부',
+  `updated_at` timestamp NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+  PRIMARY KEY (`code`),
+  KEY `idx_market` (`market`),
+  KEY `idx_sector` (`sector`),
+  KEY `idx_cap` (`market_cap` DESC),
+  KEY `idx_excluded` (`is_excluded`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+  2) 일봉정보(5년 일봉정보 저장)
+use stock_info; 
+CREATE TABLE `daily_candles` (
+  `id` bigint unsigned NOT NULL AUTO_INCREMENT,
+  `code` char(6) NOT NULL,
+  `date` date NOT NULL,
+  `open` int NOT NULL,
+  `high` int NOT NULL,
+  `low` int NOT NULL,
+  `close` int NOT NULL,
+  `volume` bigint unsigned NOT NULL,
+  `tramount` bigint unsigned DEFAULT '0' COMMENT '거래대금(종가*거래량)',
+  `change_pct` decimal(6,2) DEFAULT NULL COMMENT '등락률(%)',
+  PRIMARY KEY (`id`),
+  UNIQUE KEY `uk_daily_code_date` (`code`,`date`),
+  KEY `idx_daily_code` (`code`),
+  KEY `idx_daily_date` (`date`),
+  KEY `idx_daily_code_date` (`code`,`date`),
+  CONSTRAINT `fk_daily_code` FOREIGN KEY (`code`) REFERENCES `stock_base_info` (`code`) ON DELETE CASCADE ON UPDATE CASCADE
+) ENGINE=InnoDB AUTO_INCREMENT=21373824 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci;
+
+4. 재무 정보:
+
+https://comp.fnguide.com/SVO2/ASP/SVD_EarSurprise.asp?pGB=1&gicode=A484810&cID=AA&MenuYn=Y&ReportGB=&NewMenuID=203&stkGb=701 
+
+
+5. 주도섹터 검색
+#Region "Theme analyze"
+
+    Private ReadOnly _cpSvr8561T As New DSCBO1Lib.CpSvr8561T()
+    Private ReadOnly _cpSvr8563 As New CpSvr8563() ' Used to get a list of themes
+    Public Function GetAllThemes() As List(Of ThemeInfo)
+
+        ' HTS와 동일하게 당일 상승률 상위 테마를 가져오도록 수정
+        _cpSvr8563.SetInputValue(0, "1"c) ' '1': 전일대비상승율상위순
+        _cpSvr8563.BlockRequest()
+
+        Dim themes As New List(Of ThemeInfo)
+        Dim themeCount = _cpSvr8563.GetHeaderValue(0) ' Header 0: data 건수
+
+        For i = 0 To themeCount - 1
+            themes.Add(New ThemeInfo With {
+                .ThemeID = _cpSvr8563.GetDataValue(0, i).ToString(),
+                .ThemeName = _cpSvr8563.GetDataValue(1, i).ToString(),
+                .AvgChangeRate = Convert.ToDouble(_cpSvr8563.GetDataValue(3, i)) ' 3: 1일전대비 (당일 등락률)
+            })
+        Next
+        Return themes
+    End Function
+
+    Public Function GetComponentsForTheme(themeCode As String) As List(Of SectorComponent)
+        EnsureConnected()
+        Util.LogToFile($"DIAGNOSTIC: Entering GetComponentsForTheme for {themeCode} on Thread ID: {Thread.CurrentThread.ManagedThreadId}")
+        Dim sw As New Stopwatch()
+        sw.Start()
+        _cpSvr8561T.SetInputValue(0, CShort(themeCode))
+        _cpSvr8561T.BlockRequest()
+        sw.Stop()
+        Util.LogToFile($"DIAGNOSTIC: GetComponentsForTheme BlockRequest() finished in {sw.ElapsedMilliseconds}ms on Thread ID: {Thread.CurrentThread.ManagedThreadId}")
+
+        Dim components As New List(Of SectorComponent)
+        Dim stockCount = _cpSvr8561T.GetHeaderValue(1)
+        If stockCount = 0 Then Return components
+
+        For i = 0 To stockCount - 1
+            ' Data based on 테마별종목.txt spec
+            Dim code = _cpSvr8561T.GetDataValue(0, i).ToString().Trim()
+            Dim name = _cpSvr8561T.GetDataValue(1, i).ToString().Trim()
+            Dim price = Util.sTol(_cpSvr8561T.GetDataValue(2, i).ToString()) ' Util 함수 사용
+            Dim changeRate = Util.sTod(_cpSvr8561T.GetDataValue(4, i).ToString(), True) ' 등락률 (부호 유지)
+            Dim volume = Util.sTol(_cpSvr8561T.GetDataValue(5, i).ToString()) ' 거래량
+
+            ' Calculate Trading Value in millions
+            Dim tradingValue = 0L
+            If price > 0 AndAlso volume > 0 Then
+                tradingValue = Convert.ToInt64((CDec(price) * CDec(volume)) / 1000000D)
+            End If
+
+            components.Add(New SectorComponent With {
+                .StockCode = code.TrimStart("A"c), ' Normalize code for Kiwoom API (Remove 'A' prefix)
+                .StockName = name,
+                .CurrentPrice = price,
+                .ChangeRate = changeRate,
+                .Volume = volume,
+                .TradingValue = tradingValue
+            })
+        Next
+        Return components
+    End Function
+
+    ''' <summary>
+    ''' 지정된 과거 날짜를 기준으로 각 테마의 평균 등락률을 계산하여 테마 목록을 반환합니다.
+    ''' 이 함수는 많은 데이터를 요청하므로 시간이 걸릴 수 있습니다.
+    ''' </summary>
+    ''' <param name="targetDate">분석할 과거 날짜입니다.</param>
+    ''' <returns>과거 등락률이 포함된 ThemeInfo 리스트입니다.</returns>
+    Public Async Function GetAllThemesWithPastChangeRate(targetDate As DateTime) As Task(Of List(Of ThemeInfo))
+        EnsureConnected()
+
+        ' 1. 현재 기준의 모든 테마 목록을 가져옵니다.
+        Dim allThemes = GetAllThemes()
+        Debug.Print($"총 {allThemes.Count}개의 테마 목록 확인. 과거 등락률 재구성 시작...")
+
+        ' 2. 분석일과 그 전 거래일을 yyyyMMdd 형식으로 준비합니다.
+        Dim targetDateStr = targetDate.ToString("yyyyMMdd")
+        Dim prevDate = targetDate.AddDays(-1)
+        ' 주말/휴일 처리
+        While prevDate.DayOfWeek = DayOfWeek.Saturday OrElse prevDate.DayOfWeek = DayOfWeek.Sunday
+            prevDate = prevDate.AddDays(-1)
+        End While
+        Dim prevDateStr = prevDate.ToString("yyyyMMdd")
+
+        ' 3. 각 테마의 평균 등락률을 계산합니다.
+        For Each theme In allThemes
+            Dim components = GetComponentsForTheme(theme.ThemeID)
+            If Not components.Any() Then Continue For
+
+            Dim totalChangeRate As Double = 0
+            Dim validComponentCount As Integer = 0
+
+            For Each component In components
+                Try
+                    ' 해당 종목의 이틀치 일봉 데이터를 가져옵니다.
+                    Dim candles = Await getCandlesWithPeriodAsync(component.StockCode, "D1", prevDateStr, targetDateStr)
+                    If candles Is Nothing OrElse candles.Count < 2 Then Continue For
+
+                    Dim prevDayCandle = candles.FirstOrDefault(Function(c) c.Timestamp.ToString("yyyyMMdd") = prevDateStr)
+                    Dim targetDayCandle = candles.FirstOrDefault(Function(c) c.Timestamp.ToString("yyyyMMdd") = targetDateStr)
+
+                    If prevDayCandle IsNot Nothing AndAlso targetDayCandle IsNot Nothing AndAlso prevDayCandle.Close > 0 Then
+                        Dim changeRate = (targetDayCandle.Close - prevDayCandle.Close) / prevDayCandle.Close * 100
+                        totalChangeRate += changeRate
+                        validComponentCount += 1
+                    End If
+
+                    Await Task.Delay(250) ' Cybos API 요청 제한 준수 (1초에 4회)
+                Catch ex As Exception
+                    Debug.Print($"종목({component.StockCode}) 과거 데이터 조회 중 오류: {ex.Message}")
+                End Try
+            Next
+
+            If validComponentCount > 0 Then
+                theme.AvgChangeRate = totalChangeRate / validComponentCount
+            Else
+                theme.AvgChangeRate = 0
+            End If
+            Debug.Print($"테마 '{theme.ThemeName}' 분석 완료. 평균 등락률: {theme.AvgChangeRate:F2}%")
+        Next
+
+        ' 4. 계산된 평균 등락률로 테마 목록을 정렬하여 반환합니다.
+        Return allThemes.OrderByDescending(Function(t) t.AvgChangeRate).ToList()
+    End Function
+
+#End Region
+
+
+
+
+
+6. fastGrid 사용자컨트롤:
+Imports System.Windows.Forms
+Imports System.Drawing
+Imports System.Collections.Generic
+Imports System.ComponentModel
+Imports System.Linq
+
+Public Class FastGrid
+    Inherits Control
+
+    Private _vScrollBar As VScrollBar
+    Private _rowHeight As Integer = 24
+    Private _headerHeight As Integer = 30
+    
+    ' Internal Data Model (Hybrid Support)
+    Private Class GridColumn
+        Public Name As String
+        Public Title As String
+        Public Width As Integer
+    End Class
+    Private _columns As New List(Of GridColumn)()
+    Private _rows As New List(Of Dictionary(Of String, String))()
+
+    ' Events
+    Public Event CellDoubleClick As EventHandler(Of DataGridViewCellEventArgs)
+    Public Event CellClick As EventHandler(Of DataGridViewCellEventArgs)
+    Public Event CellValueNeeded As EventHandler(Of CellValueNeededEventArgs)
+
+    Public Sub New()
+        Me.DoubleBuffered = True
+        Me.ResizeRedraw = True
+        
+        _vScrollBar = New VScrollBar()
+        _vScrollBar.Dock = DockStyle.Right
+        _vScrollBar.Visible = False
+        Me.Controls.Add(_vScrollBar)
+        
+        AddHandler _vScrollBar.Scroll, AddressOf OnScroll
+    End Sub
+
+    ' ==========================================
+    ' Public API (Simulator Compatibility)
+    ' ==========================================
+    Public Sub AddColumn(name As String, title As String, width As Integer)
+        _columns.Add(New GridColumn With {.Name = name, .Title = title, .Width = width})
+        Me.Invalidate()
+    End Sub
+
+    Public Function AddRow() As Dictionary(Of String, String)
+        Dim row As New Dictionary(Of String, String)()
+        _rows.Add(row)
+        UpdateScroll()
+        Me.Invalidate()
+        Return row
+    End Function
+
+    Public Sub ClearRows()
+        _rows.Clear()
+        UpdateScroll()
+        Me.Invalidate()
+    End Sub
+
+    ' ==========================================
+    ' Legacy API (MainApp Compatibility)
+    ' ==========================================
+    Private _legacyColumnWidth As Integer = 80
+    
+    <DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)>
+    Public Property ColumnWidth As Integer
+        Get
+             Return _legacyColumnWidth
+        End Get
+        Set(value As Integer)
+             _legacyColumnWidth = value
+             ' Update existing columns if needed, or mostly for new legacy columns
+             For Each col In _columns
+                 col.Width = value
+             Next
+             Me.Invalidate()
+        End Set
+    End Property
+
+    <DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)>
+    Public Property HeaderHeight As Integer
+        Get
+             Return _headerHeight
+        End Get
+        Set(value As Integer)
+             _headerHeight = value
+             Me.Invalidate()
+        End Set
+    End Property
+
+    <DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)>
+    Public Property ColumnCount As Integer
+        Get
+            Return _columns.Count
+        End Get
+        Set(value As Integer)
+            ' 컬럼 개수 맞추기 (단순 리사이즈)
+            While _columns.Count < value
+                _columns.Add(New GridColumn With {.Name = "Col" & _columns.Count, .Title = "Col" & _columns.Count, .Width = _legacyColumnWidth})
+            End While
+            If _columns.Count > value Then
+                _columns.RemoveRange(value, _columns.Count - value)
+            End If
+            Me.Invalidate()
+        End Set
+    End Property
+
+    <DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)>
+    Public Property ColumnTitles As String()
+        Get
+            Return _columns.Select(Function(c) c.Title).ToArray()
+        End Get
+        Set(value As String())
+            If value Is Nothing Then Return
+            ' 기존 컬럼 타이틀 업데이트 또는 새 컬럼 추가
+            For i = 0 To value.Length - 1
+                If i < _columns.Count Then
+                    _columns(i).Title = value(i)
+                Else
+                    _columns.Add(New GridColumn With {.Name = "Col" & i, .Title = value(i), .Width = _legacyColumnWidth})
+                End If
+            Next
+            Me.Invalidate()
+        End Set
+    End Property
+
+    ' ==========================================
+    ' Shared RowCount
+    ' ==========================================
+    Private _virtualRowCount As Integer = 0
+    
+    <DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)>
+    Public Property RowCount As Integer
+        Get
+            Return Math.Max(_rows.Count, _virtualRowCount)
+        End Get
+        Set(value As Integer)
+            _virtualRowCount = value
+            UpdateScroll()
+            Me.Invalidate()
+        End Set
+    End Property
+
+    ' ==========================================
+    ' Internal Logic
+    ' ==========================================
+    Protected Overrides Sub OnMouseDoubleClick(e As MouseEventArgs)
+        MyBase.OnMouseDoubleClick(e)
+        Dim y = e.Y - _headerHeight
+        If y < 0 Then Return
+
+        Dim clickedRowIndex = _vScrollBar.Value + (y \ _rowHeight)
+        If clickedRowIndex >= 0 AndAlso clickedRowIndex < Me.RowCount Then
+            RaiseEvent CellDoubleClick(Me, New DataGridViewCellEventArgs(0, clickedRowIndex))
+        End If
+    End Sub
+
+    Protected Overrides Sub OnMouseClick(e As MouseEventArgs)
+        MyBase.OnMouseClick(e)
+        Dim y = e.Y - _headerHeight
+        If y < 0 Then Return
+
+        Dim clickedRowIndex = _vScrollBar.Value + (y \ _rowHeight)
+        If clickedRowIndex >= 0 AndAlso clickedRowIndex < Me.RowCount Then
+            RaiseEvent CellClick(Me, New DataGridViewCellEventArgs(0, clickedRowIndex))
+        End If
+    End Sub
+
+    Private Sub UpdateScroll()
+        Dim totalRows = Me.RowCount
+        Dim visibleRows = GetVisibleRowCount()
+        If totalRows > visibleRows Then
+            _vScrollBar.Visible = True
+            _vScrollBar.Maximum = totalRows - 1
+            _vScrollBar.LargeChange = visibleRows
+        Else
+            _vScrollBar.Visible = False
+            _vScrollBar.Value = 0
+        End If
+    End Sub
+
+    Private Function GetVisibleRowCount() As Integer
+        Return Math.Max(1, (Me.Height - _headerHeight) \ _rowHeight)
+    End Function
+
+    Private Sub OnScroll(sender As Object, e As ScrollEventArgs)
+        Me.Invalidate()
+    End Sub
+
+    Protected Overrides Sub OnResize(e As EventArgs)
+        MyBase.OnResize(e)
+        UpdateScroll()
+    End Sub
+
+    Protected Overrides Sub OnMouseWheel(e As MouseEventArgs)
+        If _vScrollBar.Visible Then
+            Dim newValue = _vScrollBar.Value - (e.Delta \ 120) * 3
+            newValue = Math.Max(0, Math.Min(newValue, _vScrollBar.Maximum - _vScrollBar.LargeChange + 1))
+            _vScrollBar.Value = newValue
+            Me.Invalidate()
+        End If
+        MyBase.OnMouseWheel(e)
+    End Sub
+
+    Protected Overrides Sub OnPaint(e As PaintEventArgs)
+        MyBase.OnPaint(e)
+        Dim g = e.Graphics
+        
+        ' 1. Draw Header
+        Dim headerRect As New Rectangle(0, 0, Me.Width, _headerHeight)
+        g.FillRectangle(New SolidBrush(Color.FromArgb(40, 40, 40)), headerRect)
+        g.DrawLine(Pens.Gray, 0, _headerHeight - 1, Me.Width, _headerHeight - 1)
+
+        Dim hX As Integer = 0
+        ' Use defined columns or default if empty
+        Dim drawCols As List(Of GridColumn) = _columns
+        
+        For Each col In drawCols
+            Dim cellRect As New Rectangle(hX, 0, col.Width, _headerHeight)
+            TextRenderer.DrawText(g, col.Title, Me.Font, cellRect, Color.Silver, TextFormatFlags.VerticalCenter Or TextFormatFlags.HorizontalCenter)
+            g.DrawLine(Pens.DimGray, cellRect.Right, 0, cellRect.Right, _headerHeight)
+            hX += col.Width
+        Next
+
+        ' 2. Draw Data Rows
+        Dim scrollOffset = _vScrollBar.Value
+        Dim visibleRows = GetVisibleRowCount() + 1
+        Dim totalRows = Me.RowCount
+        
+        Dim firstRow = scrollOffset
+        Dim lastRow = Math.Min(totalRows - 1, firstRow + visibleRows)
+
+        For i = firstRow To lastRow
+            Dim y = _headerHeight + (i - firstRow) * _rowHeight
+            Dim rowRect As New Rectangle(0, y, Me.Width - (If(_vScrollBar.Visible, _vScrollBar.Width, 0)), _rowHeight)
+            
+            ' Background
+            If i Mod 2 = 0 Then
+                g.FillRectangle(Brushes.Black, rowRect)
+            Else
+                Using b As New SolidBrush(Color.FromArgb(20, 20, 20))
+                    g.FillRectangle(b, rowRect)
+                End Using
+            End If
+            
+            ' Cell Values
+            Dim x As Integer = 0
+            
+            For c = 0 To drawCols.Count - 1
+                Dim col = drawCols(c)
+                Dim cellRect As New Rectangle(x, y, col.Width, _rowHeight)
+                
+                Dim val As String = ""
+                Dim textColor As Color = Color.White
+                
+                ' Priority 1: Internal Rows (Simulator)
+                If i < _rows.Count AndAlso _rows(i).ContainsKey(col.Name) Then
+                    val = _rows(i)(col.Name)
+                    
+                     ' Simple Coloring for Simulator
+                    If col.Name = "PnL" OrElse col.Name = "HighPnL" Then
+                        If val.StartsWith("-") Then textColor = Color.DodgerBlue Else textColor = Color.Crimson
+                    ElseIf col.Name = "Score" Then
+                         Dim score As Double
+                         If Double.TryParse(val, score) AndAlso score >= 80 Then textColor = Color.Gold
+                    End If
+                Else
+                    ' Priority 2: Virtual Mode Event (MainApp)
+                    Dim args As New CellValueNeededEventArgs(i, c)
+                    RaiseEvent CellValueNeeded(Me, args)
+                    If args.Value IsNot Nothing Then val = args.Value.ToString()
+                    If Not args.TextColor.IsEmpty Then textColor = args.TextColor
+                End If
+
+                TextRenderer.DrawText(g, val, Me.Font, cellRect, textColor, TextFormatFlags.VerticalCenter Or TextFormatFlags.Right)
+                g.DrawLine(Pens.DimGray, cellRect.Right, cellRect.Top, cellRect.Right, cellRect.Bottom)
+                x += col.Width
+            Next
+            
+            g.DrawLine(Pens.DimGray, rowRect.Left, rowRect.Bottom, rowRect.Right, rowRect.Bottom)
+        Next
+    End Sub
+
+End Class
+
+Public Class CellValueNeededEventArgs
+    Inherits EventArgs
+    Public Property RowIndex As Integer
+    Public Property ColumnIndex As Integer
+    Public Property Value As Object
+    Public Property TextColor As Color 
+
+    Public Sub New(r As Integer, c As Integer)
+        RowIndex = r
+        ColumnIndex = c
+        TextColor = Color.Empty 
+    End Sub
+End Class
+
+
+
+
