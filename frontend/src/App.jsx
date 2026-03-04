@@ -204,7 +204,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         autoSize: true,
         layout: { background: { type: ColorType.Solid, color: '#080810' }, textColor: '#666', fontSize: 9 },
         grid: { vertLines: { color: '#141428' }, horzLines: { color: '#141428' } },
-        timeScale: { visible: false, rightOffset: 5 },
+        timeScale: { visible: false },
         rightPriceScale: { borderColor: '#222', scaleMargins: { top: 0.05, bottom: 0.05 } },
         crosshair: { vertLine: { visible: false }, horzLine: { color: '#444', style: 2 } },
         handleScroll: false, handleScale: false,
@@ -216,9 +216,9 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       rsiSeries.createPriceLine({ price: 30, color: '#00cc6666', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })
       rsiSeries.createPriceLine({ price: 50, color: '#ffffff22', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })
 
-      chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
+      chart.timeScale().subscribeVisibleTimeRangeChange((range) => {
         if (range && rsiChart) {
-          try { rsiChart.timeScale().setVisibleLogicalRange(range) } catch(_) {}
+          try { rsiChart.timeScale().setVisibleRange(range) } catch(_) {}
         }
       })
     }
@@ -260,8 +260,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       if (rsiChart) {
         requestAnimationFrame(() => {
           try {
-            const range = chart.timeScale().getVisibleLogicalRange()
-            if (range) rsiChart.timeScale().setVisibleLogicalRange(range)
+            const range = chart.timeScale().getVisibleRange()
+            if (range) rsiChart.timeScale().setVisibleRange(range)
           } catch(_) {}
         })
       }
@@ -316,8 +316,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         rsiSeriesRef.current.update(last)
         setRsiValue(last.value)
         try {
-          const range = chartRef.current?.timeScale()?.getVisibleLogicalRange()
-          if (range && rsiChartRef.current) rsiChartRef.current.timeScale().setVisibleLogicalRange(range)
+          const range = chartRef.current?.timeScale()?.getVisibleRange()
+          if (range && rsiChartRef.current) rsiChartRef.current.timeScale().setVisibleRange(range)
         } catch(_) {}
       }
     }
