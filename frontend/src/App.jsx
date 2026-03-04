@@ -143,6 +143,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
   const lastBarRef = useRef(null)
   const chartRef = useRef(null)
   const rsiChartRef = useRef(null)
+  const [rsiValue, setRsiValue] = useState(null)
+  const [stTrend, setStTrend] = useState(null) // 1=bull, -1=bear
 
   useEffect(() => {
     if (!containerRef.current) return
@@ -171,10 +173,10 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       candleSeries.createPriceLine({ price: prevPrice, color: '#ffffff44', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '전일' })
     }
     if (buyLevels) {
-      if (buyLevels.L1) candleSeries.createPriceLine({ price: buyLevels.L1, color: '#00cc6688', lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: 'L1' })
-      if (buyLevels.L2) candleSeries.createPriceLine({ price: buyLevels.L2, color: '#00aaff88', lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: 'L2' })
-      if (buyLevels.L3) candleSeries.createPriceLine({ price: buyLevels.L3, color: '#aa88ff88', lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: 'L3' })
-      if (buyLevels.stop) candleSeries.createPriceLine({ price: buyLevels.stop, color: '#ff000088', lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: '손절' })
+      if (buyLevels.L1) candleSeries.createPriceLine({ price: buyLevels.L1, color: '#00cc6688', lineWidth: 1, lineStyle: 1, axisLabelVisible: false, title: 'L1' })
+      if (buyLevels.L2) candleSeries.createPriceLine({ price: buyLevels.L2, color: '#00aaff88', lineWidth: 1, lineStyle: 1, axisLabelVisible: false, title: 'L2' })
+      if (buyLevels.L3) candleSeries.createPriceLine({ price: buyLevels.L3, color: '#aa88ff88', lineWidth: 1, lineStyle: 1, axisLabelVisible: false, title: 'L3' })
+      if (buyLevels.stop) candleSeries.createPriceLine({ price: buyLevels.stop, color: '#ff000088', lineWidth: 2, lineStyle: 0, axisLabelVisible: false, title: '손절' })
     }
 
     let stBull = null, stBear = null
@@ -183,7 +185,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         color: '#00cc66', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
       })
       stBear = chart.addSeries(LineSeries, {
-        color: '#ff4444', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        color: '#ff8800', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
       })
     }
 
@@ -221,9 +223,11 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
     const candles = candleData || (window.__CANDLE_HISTORY?.[code]) || []
     if (candles.length > 0) {
       candleSeries.setData(candles)
+      const avgVol = candles.reduce((s, c) => s + (c.volume || 0), 0) / (candles.length || 1)
       volumeSeries.setData(candles.map(c => ({
         time: c.time, value: c.volume || 0,
-        color: c.close >= c.open ? '#ef535066' : '#2962ff66',
+        color: (c.volume || 0) > avgVol * 2 ? '#ffcc0099'
+             : c.close >= c.open ? '#ef535066' : '#2962ff66',
       })))
       lastBarRef.current = { ...candles[candles.length - 1] }
 
@@ -236,11 +240,13 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         })
         stBull.setData(bullData)
         stBear.setData(bearData)
+        if (st.length > 0) setStTrend(st[st.length - 1].trend)
       }
 
       if (rsiSeries && indicators.rsi.enabled) {
         const rsi = calcRSI(candles, indicators.rsi.period)
         rsiSeries.setData(rsi)
+        if (rsi.length > 0) setRsiValue(rsi[rsi.length - 1].value)
       }
     }
 
@@ -286,18 +292,24 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
   return (
     <div onClick={onFocus} style={{
       display: 'flex', flexDirection: 'column',
-      border: `${focused ? 2 : 1}px solid ${borderColor}`,
+      border: `${focused ? 3 : 1}px solid ${borderColor}`,
       borderRadius: 2, background: '#0a0a0a', overflow: 'hidden', height: '100%', cursor: 'pointer',
     }}>
       <div style={{
         display: 'flex', alignItems: 'center', gap: 6,
-        padding: '2px 6px', background: focused ? '#1a1500' : '#111',
+        padding: '2px 6px', background: focused ? '#332200' : '#111',
         borderBottom: `2px solid ${borderColor}`, height: 30, flexShrink: 0,
       }}>
         <span style={{ fontWeight: 'bold', fontSize: 11, color: focused ? '#ffcc00' : '#eee', minWidth: 55 }}>{title}</span>
         <span style={{ fontSize: 11, fontWeight: 'bold', color: chgColor }}>{price?.toLocaleString()}</span>
         <span style={{ fontSize: 9, color: chgColor }}>{chg >= 0 ? '+' : ''}{chg.toFixed(2)}%</span>
         {whipsaw?.drawdown_pct ? <span style={{ fontSize: 8, color: '#ff8888' }}>↓{whipsaw.drawdown_pct}%</span> : null}
+        {indicators.supertrend.enabled && stTrend !== null && (
+          <span style={{ fontSize: 10, color: stTrend === 1 ? '#00cc66' : '#ff8800' }}>{stTrend === 1 ? '▲' : '▼'}</span>
+        )}
+        {indicators.rsi.enabled && rsiValue !== null && (
+          <span style={{ fontSize: 8, color: rsiValue >= 70 ? '#ff4444' : rsiValue <= 30 ? '#00cc66' : '#e0aa00' }}>RSI {rsiValue}</span>
+        )}
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 3 }} onClick={e => e.stopPropagation()}>
           <button onClick={onBuy} disabled={isBuyDisabled} style={{
             background: '#003300', color: '#0f0', border: '1px solid #060',
@@ -311,7 +323,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       </div>
       <div ref={containerRef} style={{ flex: indicators.rsi.enabled ? 3 : 1, minHeight: 0 }} />
       {indicators.rsi.enabled && (
-        <div style={{ borderTop: '1px solid #222', position: 'relative', flexShrink: 0, height: '22%', minHeight: 40 }}>
+        <div style={{ borderTop: '1px solid #222', position: 'relative', flexShrink: 0, height: '15%', minHeight: 36 }}>
           <span style={{ position: 'absolute', top: 1, left: 4, fontSize: 8, color: '#e0aa00', zIndex: 2, pointerEvents: 'none' }}>RSI({indicators.rsi.period})</span>
           <div ref={rsiContainerRef} style={{ width: '100%', height: '100%' }} />
         </div>
@@ -368,7 +380,9 @@ function MacroBar({ state }) {
       <span style={{ fontSize:10, color: news_sentiment?.startsWith('NEG') ? '#ff6666' : news_sentiment?.startsWith('POS') ? '#66ff99' : '#888' }}>뉴스:{news_sentiment}</span>
       <span style={{ marginLeft:'auto', display:'flex', alignItems:'center', gap:6 }}>
         <PnlSparkline history={pnl_history} />
-        <span style={{ color: pnlColor, fontWeight:'bold' }}>일손익 {daily_pnl >= 0 ? '+' : ''}{daily_pnl?.toLocaleString()}원</span>
+        <span style={{ color: pnlColor, fontWeight:'bold', fontSize:14, background: daily_pnl >= 0 ? '#003310' : '#330008', padding:'1px 6px', borderRadius:3 }}>
+          {daily_pnl >= 0 ? '+' : ''}{daily_pnl?.toLocaleString()}원
+        </span>
       </span>
       <span style={{ color: auto_trading ? '#0c6' : '#f80', fontSize:10 }}>[{auto_trading ? '자동ON' : '자동OFF'}]</span>
     </div>
@@ -481,9 +495,11 @@ function IndicatorSettings({ indicators, onChange }) {
 // ═══════════════════════════════════════════════════════════════
 
 function SidePanel({ state, panels, focusedIdx, onChangeFocused, onChangePanel, tf, onChangeTF, indicators, onChangeIndicators }) {
+  const [sigFilter, setSigFilter] = useState('ALL')
   const signals = state?.signals || []
   const holdings = state?.holdings || []
   const actionColor = { BUY:'#0c6', SELL:'#f44', HOLD:'#888' }
+  const filteredSignals = sigFilter === 'ALL' ? signals : signals.filter(s => s.action === sigFilter)
 
   return (
     <div style={{ width:260, display:'flex', flexDirection:'column', borderLeft:'1px solid #222', background:'#0a0a0a', overflow:'hidden', flexShrink:0 }}>
@@ -555,8 +571,18 @@ function SidePanel({ state, panels, focusedIdx, onChangeFocused, onChangePanel, 
       </div>
 
       <div style={{ flex:1, overflow:'auto', padding:'4px 8px' }}>
-        <div style={{ fontSize:10, color:'#666', marginBottom:2 }}>시그널 로그</div>
-        {signals.slice(0,100).map((s,i) => (
+        <div style={{ display:'flex', alignItems:'center', gap:4, marginBottom:4 }}>
+          <span style={{ fontSize:10, color:'#666' }}>시그널</span>
+          {['ALL','BUY','SELL','HOLD'].map(f => (
+            <button key={f} onClick={() => setSigFilter(f)} style={{
+              fontSize:8, padding:'1px 4px', cursor:'pointer', borderRadius:2,
+              background: f === sigFilter ? (f==='BUY'?'#003300':f==='SELL'?'#330000':f==='HOLD'?'#222':'#002244') : '#111',
+              color: f === sigFilter ? (f==='BUY'?'#0c6':f==='SELL'?'#f44':f==='HOLD'?'#888':'#66aaff') : '#555',
+              border: `1px solid ${f === sigFilter ? '#444' : '#333'}`,
+            }}>{f}</button>
+          ))}
+        </div>
+        {filteredSignals.slice(0,100).map((s,i) => (
           <div key={i} style={{ fontSize:8, color:'#aaa', lineHeight:1.5 }}>
             <span style={{ color:'#666' }}>{s.ts || '--:--:--'}</span>{' '}
             <span style={{ color: actionColor[s.action] || '#888' }}>[{s.action}]</span>{' '}
@@ -587,12 +613,15 @@ export default function TradingDashboard() {
   })
   const ws = useRef(null)
   const prevSignalCountRef = useRef(0)
+  const [crosshairSync, setCrosshairSync] = useState(true)
+  const crosshairSyncRef = useRef(true)
   const chartRegistryRef = useRef({})  // { [chartKey]: { chart, series } }
   const crosshairSyncingRef = useRef(false)
 
   const registerChart = useCallback((key, chart, series) => {
     chartRegistryRef.current[key] = { chart, series }
     chart.subscribeCrosshairMove(param => {
+      if (!crosshairSyncRef.current) return
       if (crosshairSyncingRef.current) return
       crosshairSyncingRef.current = true
       Object.entries(chartRegistryRef.current).forEach(([k, entry]) => {
@@ -614,6 +643,8 @@ export default function TradingDashboard() {
   const unregisterChart = useCallback((key) => {
     delete chartRegistryRef.current[key]
   }, [])
+
+  useEffect(() => { crosshairSyncRef.current = crosshairSync }, [crosshairSync])
 
   const layout = LAYOUTS[layoutIdx]
   const visibleCount = layout.cols * layout.rows
@@ -691,6 +722,25 @@ export default function TradingDashboard() {
     return () => { clearTimeout(reconnectTimer); ws.current?.close() }
   }, [])
 
+  // 키보드 단축키
+  useEffect(() => {
+    const handler = (e) => {
+      if (e.target.tagName === 'INPUT' || e.target.tagName === 'SELECT') return
+      const n = parseInt(e.key)
+      if (!isNaN(n) && n >= 1 && n <= 9) {
+        setFocusedIdx(Math.min(n - 1, visibleCount - 1))
+      } else if (e.key === 'Escape') {
+        setSellConfirm(null)
+      } else if (e.key === ']') {
+        setTF(prev => { const i = TIMEFRAMES.indexOf(prev); return TIMEFRAMES[Math.min(i + 1, TIMEFRAMES.length - 1)] })
+      } else if (e.key === '[') {
+        setTF(prev => { const i = TIMEFRAMES.indexOf(prev); return TIMEFRAMES[Math.max(i - 1, 0)] })
+      }
+    }
+    window.addEventListener('keydown', handler)
+    return () => window.removeEventListener('keydown', handler)
+  }, [visibleCount])
+
   const send = useCallback((payload) => {
     if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify(payload))
   }, [])
@@ -738,6 +788,12 @@ export default function TradingDashboard() {
             }}>{l.id}</button>
           ))}
         </div>
+        <button onClick={() => setCrosshairSync(v => !v)} title="크로스헤어 동기화 ON/OFF" style={{
+          marginLeft:8, fontSize:9, padding:'1px 6px', cursor:'pointer', borderRadius:2,
+          background: crosshairSync ? '#002244' : '#111',
+          color: crosshairSync ? '#66aaff' : '#555',
+          border: `1px solid ${crosshairSync ? '#224488' : '#333'}`,
+        }}>⊕{crosshairSync ? 'SYNC' : 'FREE'}</button>
       </div>
 
       <MacroBar state={state} />
