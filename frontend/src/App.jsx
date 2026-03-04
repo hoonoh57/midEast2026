@@ -317,10 +317,13 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       if (lastRsi?.value !== undefined) {
         rsiSeriesRef.current.update(lastRsi)
         setRsiValue(lastRsi.value)
-        try {
-          const range = chartRef.current?.timeScale()?.getVisibleLogicalRange()
-          if (range && rsiChartRef.current) rsiChartRef.current.timeScale().setVisibleLogicalRange(range)
-        } catch(_) {}
+        // rAF: lightweight-charts 내부 auto-scroll rAF 이후에 sync 실행
+        requestAnimationFrame(() => {
+          try {
+            const range = chartRef.current?.timeScale()?.getVisibleLogicalRange()
+            if (range && rsiChartRef.current) rsiChartRef.current.timeScale().setVisibleLogicalRange(range)
+          } catch(_) {}
+        })
       }
     }
 
