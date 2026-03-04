@@ -141,8 +141,48 @@ function calcRSI(candles, period = 14) {
   return result
 }
 
+function calcJMA(candles, period = 7, phase = 50, power = 2) {
+  if (candles.length < 2) return { data: [], state: null }
+
+  const phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
+  const beta = 0.45 * (period - 1) / (0.45 * (period - 1) + 2)
+  const alpha = Math.pow(beta, power)
+
+  let e0 = NaN, e1 = NaN, e2 = NaN, prevJMA = NaN
+  const result = []
+
+  for (let i = 0; i < candles.length; i++) {
+    const src = candles[i].close
+
+    if (isNaN(e0)) { e0 = src; e1 = 0; e2 = 0; prevJMA = src }
+
+    e0 = (1 - alpha) * src + alpha * e0
+    e1 = (src - e0) * (1 - beta) + beta * e1
+    e2 = (e0 + phaseRatio * e1 - prevJMA) * Math.pow(1 - alpha, 2) + Math.pow(alpha, 2) * e2
+
+    let jma
+    if (i < period) {
+      let sum = 0
+      for (let j = 0; j <= i; j++) sum += candles[j].close
+      jma = Math.round((sum / (i + 1)) * 10) / 10
+    } else {
+      jma = Math.round((e2 + prevJMA) * 10) / 10
+    }
+
+    const isUptrend = jma > prevJMA ? true : jma < prevJMA ? false
+      : (result.length > 0 ? result[result.length - 1].isUptrend : true)
+    result.push({ time: candles[i].time, value: jma, isUptrend })
+    prevJMA = jma
+  }
+
+  return {
+    data: result,
+    state: { e0, e1, e2, prevJMA, lastIsUptrend: result[result.length - 1]?.isUptrend ?? true }
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════
-// 실시간 캔들 차트 + SuperTrend + RSI
+// 실시간 캔들 차트 + SuperTrend + JMA + RSI
 // ═══════════════════════════════════════════════════════════════
 
 function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focused, onFocus, onBuy, onSell, tf, indicators, candleData, chartKey, onChartReady, onChartDestroy }) {
@@ -151,6 +191,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
   const volumeSeriesRef = useRef(null)
   const stSeriesListRef = useRef([])   // [{series, isUptrend}]
   const stStateRef = useRef(null)      // {upperBand, lowerBand, isUptrend, supertrend, lastAtr, prevClose}
+  const jmaSeriesListRef = useRef([])  // [{series, isUptrend}]
+  const jmaStateRef = useRef(null)     // {e0, e1, e2, prevJMA, lastIsUptrend}
   const rsiSeriesRef = useRef(null)
   const lastBarRef = useRef(null)
   const chartRef = useRef(null)
@@ -201,6 +243,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
     volumeSeriesRef.current = volumeSeries
     stSeriesListRef.current = []
     stStateRef.current = null
+    jmaSeriesListRef.current = []
+    jmaStateRef.current = null
 
     let rsiSeries = null
     if (indicators.rsi.enabled) {
@@ -244,6 +288,21 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
           return { series: s, isUptrend: seg.isUptrend }
         })
         if (stData.length > 0) setStTrend(stData[stData.length - 1].isUptrend ? 1 : -1)
+      }
+
+      if (indicators.jma.enabled && candles.length >= indicators.jma.period) {
+        const { data: jmaData, state: jmaState } = calcJMA(
+          candles, indicators.jma.period, indicators.jma.phase, indicators.jma.power
+        )
+        jmaStateRef.current = jmaState
+        jmaSeriesListRef.current = segmentByTrend(jmaData).map(seg => {
+          const s = chart.addSeries(LineSeries, {
+            color: seg.isUptrend ? '#00e5ff' : '#ff6e40',
+            lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+          })
+          s.setData(seg.points)
+          return { series: s, isUptrend: seg.isUptrend }
+        })
       }
 
       if (rsiSeries && indicators.rsi.enabled) {
@@ -345,6 +404,41 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       }
       stStateRef.current = { upperBand, lowerBand, isUptrend, supertrend, lastAtr: newAtr, prevClose: last.close }
       setStTrend(isUptrend ? 1 : -1)
+    }
+
+    // JMA 증분 업데이트 — O(1)
+    const jmaCfg = indicatorsRef.current?.jma
+    if (jmaSeriesListRef.current.length > 0 && jmaStateRef.current && jmaCfg?.enabled) {
+      const jst = jmaStateRef.current
+      const src = candlesRef.current[candlesRef.current.length - 1].close
+      const time = candlesRef.current[candlesRef.current.length - 1].time
+
+      const phaseRatio = jmaCfg.phase < -100 ? 0.5 : jmaCfg.phase > 100 ? 2.5 : jmaCfg.phase / 100 + 1.5
+      const beta = 0.45 * (jmaCfg.period - 1) / (0.45 * (jmaCfg.period - 1) + 2)
+      const alpha = Math.pow(beta, jmaCfg.power)
+
+      jst.e0 = (1 - alpha) * src + alpha * jst.e0
+      jst.e1 = (src - jst.e0) * (1 - beta) + beta * jst.e1
+      jst.e2 = (jst.e0 + phaseRatio * jst.e1 - jst.prevJMA) * Math.pow(1 - alpha, 2) + Math.pow(alpha, 2) * jst.e2
+
+      const jma = Math.round((jst.e2 + jst.prevJMA) * 10) / 10
+      const isUptrend = jma > jst.prevJMA ? true : jma < jst.prevJMA ? false : jst.lastIsUptrend
+      const point = { time, value: jma }
+      const lastEntry = jmaSeriesListRef.current[jmaSeriesListRef.current.length - 1]
+
+      if (lastEntry.isUptrend === isUptrend) {
+        lastEntry.series.update(point)
+      } else {
+        lastEntry.series.update(point)
+        const newSeries = chartRef.current.addSeries(LineSeries, {
+          color: isUptrend ? '#00e5ff' : '#ff6e40',
+          lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        })
+        newSeries.setData([point])
+        jmaSeriesListRef.current.push({ series: newSeries, isUptrend })
+      }
+      jst.prevJMA = jma
+      jst.lastIsUptrend = isUptrend
     }
   }, [price, tf])
 
@@ -489,7 +583,7 @@ function SellConfirmDialog({ code, name, onConfirm, onCancel }) {
 
 function IndicatorSettings({ indicators, onChange }) {
   const [open, setOpen] = useState(false)
-  const { supertrend, rsi } = indicators
+  const { supertrend, jma, rsi } = indicators
 
   const update = (key, field, val) => {
     onChange({ ...indicators, [key]: { ...indicators[key], [field]: val } })
@@ -522,6 +616,34 @@ function IndicatorSettings({ indicators, onChange }) {
                   Multi
                   <input type="number" value={supertrend.multiplier} min={0.5} max={10} step={0.5}
                     onChange={e => update('supertrend','multiplier',parseFloat(e.target.value)||3)}
+                    style={{ width:36, marginLeft:3, background:'#111', color:'#ccc', border:'1px solid #333', fontSize:9, textAlign:'center' }} />
+                </label>
+              </div>
+            )}
+          </div>
+          <div style={{ marginBottom:6 }}>
+            <label style={{ fontSize:9, color:'#ccc', display:'flex', alignItems:'center', gap:4, cursor:'pointer' }}>
+              <input type="checkbox" checked={jma.enabled} onChange={e => update('jma','enabled',e.target.checked)} />
+              <span style={{ color: jma.enabled ? '#00e5ff' : '#666' }}>JMA</span>
+            </label>
+            {jma.enabled && (
+              <div style={{ display:'flex', gap:6, marginTop:3, marginLeft:16 }}>
+                <label style={{ fontSize:9, color:'#999' }}>
+                  Period
+                  <input type="number" value={jma.period} min={1} max={50}
+                    onChange={e => update('jma','period',parseInt(e.target.value)||7)}
+                    style={{ width:36, marginLeft:3, background:'#111', color:'#ccc', border:'1px solid #333', fontSize:9, textAlign:'center' }} />
+                </label>
+                <label style={{ fontSize:9, color:'#999' }}>
+                  Phase
+                  <input type="number" value={jma.phase} min={-100} max={100}
+                    onChange={e => update('jma','phase',parseInt(e.target.value)||50)}
+                    style={{ width:36, marginLeft:3, background:'#111', color:'#ccc', border:'1px solid #333', fontSize:9, textAlign:'center' }} />
+                </label>
+                <label style={{ fontSize:9, color:'#999' }}>
+                  Power
+                  <input type="number" value={jma.power} min={1} max={10}
+                    onChange={e => update('jma','power',parseInt(e.target.value)||2)}
                     style={{ width:36, marginLeft:3, background:'#111', color:'#ccc', border:'1px solid #333', fontSize:9, textAlign:'center' }} />
                 </label>
               </div>
@@ -668,6 +790,7 @@ export default function TradingDashboard() {
   const [candleCache, setCandleCache] = useState({})
   const [indicators, setIndicators] = useState({
     supertrend: { enabled: true, period: 10, multiplier: 3 },
+    jma: { enabled: false, period: 7, phase: 50, power: 2 },
     rsi: { enabled: true, period: 14 },
   })
   const ws = useRef(null)
