@@ -47,6 +47,11 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, onBuy, onSell }
   useEffect(() => {
     if (!containerRef.current) return
 
+    // 높이 보호 — 컨테이너가 아직 렌더링되지 않았으면 최소값 보장
+    const cw = containerRef.current.clientWidth || 300
+    const ch = containerRef.current.clientHeight
+    const chartHeight = Math.max(ch - 36, 100)
+
     const chart = createChart(containerRef.current, {
       layout: {
         background: { type: ColorType.Solid, color: '#0a0a0a' },
@@ -57,8 +62,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, onBuy, onSell }
         vertLines: { color: '#1a1a2e' },
         horzLines: { color: '#1a1a2e' },
       },
-      width: containerRef.current.clientWidth,
-      height: containerRef.current.clientHeight - 36,
+      width: cw,
+      height: chartHeight,
       timeScale: {
         timeVisible: true,
         secondsVisible: true,
@@ -112,8 +117,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, onBuy, onSell }
     const handleResize = () => {
       if (containerRef.current) {
         chart.applyOptions({
-          width: containerRef.current.clientWidth,
-          height: containerRef.current.clientHeight - 36,
+          width: containerRef.current.clientWidth || 300,
+          height: Math.max(containerRef.current.clientHeight - 36, 100),
         })
       }
     }
