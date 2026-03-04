@@ -142,33 +142,26 @@ function calcRSI(candles, period = 14) {
 }
 
 function calcJMA(candles, period = 7, phase = 50, power = 2) {
-  if (candles.length < 2) return { data: [], state: null }
+  if (candles.length <= period) return { data: [], state: null }
 
   const phaseRatio = phase < -100 ? 0.5 : phase > 100 ? 2.5 : phase / 100 + 1.5
   const beta = 0.45 * (period - 1) / (0.45 * (period - 1) + 2)
   const alpha = Math.pow(beta, power)
 
-  let e0 = NaN, e1 = NaN, e2 = NaN, prevJMA = NaN
+  // SMA로 초기화 — warmup 누적 없이 깨끗하게 시작
+  let sumInit = 0
+  for (let i = 0; i < period; i++) sumInit += candles[i].close
+  let prevJMA = sumInit / period
+  let e0 = prevJMA, e1 = 0, e2 = 0
+
   const result = []
 
-  for (let i = 0; i < candles.length; i++) {
+  for (let i = period; i < candles.length; i++) {
     const src = candles[i].close
-
-    if (isNaN(e0)) { e0 = src; e1 = 0; e2 = 0; prevJMA = src }
-
     e0 = (1 - alpha) * src + alpha * e0
     e1 = (src - e0) * (1 - beta) + beta * e1
     e2 = (e0 + phaseRatio * e1 - prevJMA) * Math.pow(1 - alpha, 2) + Math.pow(alpha, 2) * e2
-
-    let jma
-    if (i < period) {
-      let sum = 0
-      for (let j = 0; j <= i; j++) sum += candles[j].close
-      jma = Math.round((sum / (i + 1)) * 10) / 10
-    } else {
-      jma = Math.round((e2 + prevJMA) * 10) / 10
-    }
-
+    const jma = Math.round((e2 + prevJMA) * 10) / 10
     const isUptrend = jma > prevJMA ? true : jma < prevJMA ? false
       : (result.length > 0 ? result[result.length - 1].isUptrend : true)
     result.push({ time: candles[i].time, value: jma, isUptrend })
