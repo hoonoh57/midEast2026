@@ -27,6 +27,13 @@ from enum import Enum
 from dotenv import load_dotenv
 import logging
 
+try:
+    import uvicorn
+    from web_server import app as _web_app, engine_state, set_engine_ref
+    WEB_ENABLED = True
+except ImportError:
+    WEB_ENABLED = False
+
 load_dotenv()
 
 logging.basicConfig(
@@ -1332,6 +1339,7 @@ class WarAdaptiveEngine:
         self._last_external_update = datetime.min
         self._cycle_count = 0
         self._running = False
+        self.auto_trading_enabled = True
 
     def initialize(self) -> bool:
         if not self.api.login():
@@ -1464,7 +1472,11 @@ class WarAdaptiveEngine:
                         all_signals.extend(sigs)
 
                 for sig in all_signals:
-                    self.executor.process_signal(sig, holdings)
+                    if self.auto_trading_enabled:
+                        self.executor.process_signal(sig, holdings)
+
+                if WEB_ENABLED:
+                    _update_web_state(self, holdings, all_signals)
 
                 elapsed = time.time() - cycle_start
                 if self._cycle_count % 5 == 0:
@@ -1517,11 +1529,85 @@ class WarAdaptiveEngine:
 
 
 # ═══════════════════════════════════════════════════════════════
+# WEB SERVER HELPERS
+# ═══════════════════════════════════════════════════════════════
+
+def _start_web_server():
+    """별도 daemon 스레드에서 FastAPI/uvicorn 실행"""
+    uvicorn.run(_web_app, host="0.0.0.0", port=5000, log_level="warning")
+
+
+def _update_web_state(engine: 'WarAdaptiveEngine', holdings: list, all_signals: list):
+    """매 루프 사이클마다 web engine_state 갱신 — 엔진과 화면 동기화"""
+    rt_prices = engine.rt.prices
+
+    # 보유종목: 한국어 키 → 웹 친화적 dict + pnl 계산
+    holdings_web = []
+    for h in holdings:
+        code = h.get('종목코드', '').strip()
+        qty = int(h.get('보유수량', '0'))
+        avg = int(h.get('매입단가', '0'))
+        cur = rt_prices.get(code, avg)
+        pnl = (cur - avg) * qty
+        pnl_pct = round((cur / avg - 1) * 100, 2) if avg > 0 else 0
+        name = TARGETS[code].name if code in TARGETS else code
+        holdings_web.append({
+            "code": code, "name": name, "qty": qty,
+            "avg_price": avg, "current": cur,
+            "pnl": pnl, "pnl_pct": pnl_pct,
+        })
+
+    # Signal dataclass → dict (최근 200건)
+    signals_web = [
+        {"code": s.code, "name": s.name, "action": s.action,
+         "price": s.price, "qty": s.quantity, "confidence": s.confidence,
+         "chart": s.chart, "reason": s.reason, "ts": s.timestamp}
+        for s in all_signals[-200:]
+    ]
+
+    # 요동장 상태
+    ws_status = {}
+    for code, t in engine.whipsaw.trackers.items():
+        ws_status[code] = {
+            "name": t.name,
+            "flag": ("emergency" if t.sell_triggered else
+                     "crash" if t.crash_from_high else
+                     "near_limit" if t.hit_near_limit_up else "normal"),
+            "session_high": t.session_high,
+            "current": t.current_price,
+            "drawdown_pct": round(t.drawdown_from_high_pct * 100, 1),
+            "locked_until": (t.buy_locked_until.strftime("%H:%M")
+                             if t.buy_locked_until else None),
+        }
+
+    engine_state.update({
+        "regime": engine.chart1.regime.value,
+        "beta": engine.chart1.beta,
+        "war_day": engine.chart1.war_day_count,
+        "wti": engine.ext.latest_wti,
+        "usdkrw": engine.ext.usdkrw,
+        "news_sentiment": engine.ext.news_sentiment,
+        "prices": dict(rt_prices),
+        "holdings": holdings_web,
+        "signals": signals_web,
+        "whipsaw_status": ws_status,
+        "daily_pnl": sum(h["pnl"] for h in holdings_web),
+        "phase": engine.whipsaw.get_phase(datetime.now()).value,
+        "auto_trading": engine.auto_trading_enabled,
+    })
+
+
+# ═══════════════════════════════════════════════════════════════
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════
 
 if __name__ == '__main__':
     engine = WarAdaptiveEngine()
+    if WEB_ENABLED:
+        set_engine_ref(engine)
+        web_thread = threading.Thread(target=_start_web_server, daemon=True)
+        web_thread.start()
+        log.info("🌐 웹 대시보드: http://localhost:5000")
     if engine.initialize():
         engine.run()
     else:
