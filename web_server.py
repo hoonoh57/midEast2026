@@ -251,11 +251,12 @@ async def place_manual_order(order: ManualOrder):
 _DIST = os.path.join(os.path.dirname(__file__), "frontend", "dist")
 
 if os.path.isdir(_DIST):
-    app.mount("/static", StaticFiles(directory=_DIST), name="static")
-
     @app.get("/")
     async def serve_dashboard():
         return FileResponse(os.path.join(_DIST, "index.html"))
+
+    # 모든 API/WS 라우트 등록 이후 → 나머지 경로를 정적 파일로 서빙
+    app.mount("/", StaticFiles(directory=_DIST), name="static")
 else:
     @app.get("/")
     async def serve_placeholder():
