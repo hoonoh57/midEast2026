@@ -143,6 +143,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
   const lastBarRef = useRef(null)
   const chartRef = useRef(null)
   const rsiChartRef = useRef(null)
+  const candlesRef = useRef([])        // 현재 캔들 데이터 (RSI 실시간 계산용)
+  const indicatorsRef = useRef(indicators) // 최신 indicators 참조 (stale closure 방지)
   const [rsiValue, setRsiValue] = useState(null)
   const [stTrend, setStTrend] = useState(null) // 1=bull, -1=bear
 
@@ -220,7 +222,11 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
     rsiChartRef.current = rsiChart
     rsiSeriesRef.current = rsiSeries
 
-    const candles = candleData || (window.__CANDLE_HISTORY?.[code]) || []
+    // m1: __CANDLE_HISTORY 시드 사용 / 그 외: 서버에서 받은 candleData만 사용
+    const candles = candleData != null
+      ? candleData
+      : (tf === 'm1' ? (window.__CANDLE_HISTORY?.[code] || []) : [])
+    candlesRef.current = [...candles]
     if (candles.length > 0) {
       candleSeries.setData(candles)
       const avgVol = candles.reduce((s, c) => s + (c.volume || 0), 0) / (candles.length || 1)
@@ -259,7 +265,10 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
     }
   }, [code, prevPrice, JSON.stringify(buyLevels), tf, JSON.stringify(indicators), candleData])
 
-  // 실시간 틱 → 1분봉 누적
+  // indicatorsRef 최신 유지
+  useEffect(() => { indicatorsRef.current = indicators }, [indicators])
+
+  // 실시간 틱 → 1분봉 누적 + RSI 실시간 업데이트
   useEffect(() => {
     if (tf !== 'm1') return
     if (!price || price <= 0 || !candleSeriesRef.current) return
@@ -275,11 +284,27 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       lastBar.volume = (lastBar.volume || 0) + 1
       candleSeriesRef.current.update(lastBar)
       volumeSeriesRef.current.update({ time: barTime, value: lastBar.volume, color: price >= lastBar.open ? '#ef535066' : '#2962ff66' })
+      // 현재 봉 갱신
+      const cr = candlesRef.current
+      if (cr.length > 0) cr[cr.length - 1] = { ...lastBar }
     } else {
       const newBar = { time: barTime, open: price, high: price, low: price, close: price, volume: 1 }
       lastBarRef.current = newBar
       candleSeriesRef.current.update(newBar)
       volumeSeriesRef.current.update({ time: barTime, value: 1, color: '#888' })
+      // 새 봉 추가
+      candlesRef.current = [...candlesRef.current, newBar]
+    }
+
+    // RSI 마지막 값만 증분 업데이트
+    const rsiCfg = indicatorsRef.current?.rsi
+    if (rsiSeriesRef.current && rsiCfg?.enabled && candlesRef.current.length > rsiCfg.period) {
+      const rsiData = calcRSI(candlesRef.current, rsiCfg.period)
+      if (rsiData.length > 0) {
+        const last = rsiData[rsiData.length - 1]
+        rsiSeriesRef.current.update(last)
+        setRsiValue(last.value)
+      }
     }
   }, [price, tf])
 
@@ -666,8 +691,14 @@ export default function TradingDashboard() {
 
   const handleChangeTF = useCallback((newTF) => {
     setTF(newTF)
-    fetchCandles(newTF, panels.slice(0, visibleCount))
-  }, [fetchCandles, panels, visibleCount])
+  }, [])
+
+  // tf 변경 시 자동 fetch (버튼 클릭 + 키보드 단축키 모두 처리)
+  const tfInitRef = useRef(false)
+  useEffect(() => {
+    if (!tfInitRef.current) { tfInitRef.current = true; return }
+    fetchCandles(tf, panels.slice(0, visibleCount))
+  }, [tf])
 
   // WebSocket
   useEffect(() => {
