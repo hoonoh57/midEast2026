@@ -351,8 +351,31 @@ export default function TradingDashboard() {
       }
       ws.current.onmessage = (e) => {
         const msg = JSON.parse(e.data)
-        if (msg.type === 'snapshot') setState(msg.data)
-        if (msg.type === 'update') setState(prev => prev ? { ...prev, ...msg } : null)
+        if (msg.type === 'snapshot') {
+          setState(msg.data)
+        }
+        if (msg.type === 'update') {
+          setState(prev => {
+            if (!prev) return null
+            return {
+              ...prev,
+              prices: msg.prices ?? prev.prices,
+              regime: msg.regime ?? prev.regime,
+              beta: msg.beta ?? prev.beta,
+              war_day: msg.war_day ?? prev.war_day,
+              wti: msg.wti ?? prev.wti,
+              usdkrw: msg.usdkrw ?? prev.usdkrw,
+              news_sentiment: msg.news_sentiment ?? prev.news_sentiment,
+              phase: msg.phase ?? prev.phase,
+              whipsaw_status: msg.whipsaw_status ?? prev.whipsaw_status,
+              daily_pnl: msg.daily_pnl ?? prev.daily_pnl,
+              holdings: msg.holdings ?? prev.holdings,
+              signals: msg.signals ?? prev.signals,
+              kospi: msg.kospi ?? prev.kospi,
+              auto_trading: msg.auto_trading ?? prev.auto_trading,
+            }
+          })
+        }
       }
     }
 
@@ -395,7 +418,7 @@ export default function TradingDashboard() {
   }
 
   const prices = state.prices || {}
-  const whipsawStatus = state.whipsaw_status || state.whipsaw || {}
+  const whipsawStatus = state.whipsaw_status || {}
   const rows = [
     panels.filter(p => p.row === 0),
     panels.filter(p => p.row === 1),
