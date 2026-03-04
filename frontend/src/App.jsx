@@ -70,35 +70,51 @@ function calcATR(candles, period) {
 }
 
 function calcSuperTrend(candles, period = 10, multiplier = 3) {
+  if (candles.length < period) return { data: [], state: null }
   const atr = calcATR(candles, period)
   const result = []
-  let prevUpper = 0, prevLower = 0, prevST = 0
+  let upperBand = 0, lowerBand = 0, supertrend = 0, isUptrend = true
 
-  for (let i = 0; i < candles.length; i++) {
-    const c = candles[i]
-    const hl2 = (c.high + c.low) / 2
+  for (let i = period - 1; i < candles.length; i++) {
+    const hl2 = (candles[i].high + candles[i].low) / 2
+    const basicUpper = hl2 + multiplier * atr[i]
+    const basicLower = hl2 - multiplier * atr[i]
 
-    if (!atr[i]) { result.push(null); continue }
-
-    let upper = hl2 + multiplier * atr[i]
-    let lower = hl2 - multiplier * atr[i]
-
-    upper = (prevUpper && upper < prevUpper) ? upper : (prevUpper || upper)
-    lower = (prevLower && lower > prevLower) ? lower : (prevLower || lower)
-
-    let trend
-    if (prevST === prevUpper) {
-      trend = c.close > upper ? 1 : -1
+    if (i === period - 1) {
+      upperBand = basicUpper; lowerBand = basicLower
+      isUptrend = candles[i].close > hl2
     } else {
-      trend = c.close < lower ? -1 : 1
+      upperBand = basicUpper < upperBand || candles[i-1].close > upperBand ? basicUpper : upperBand
+      lowerBand = basicLower > lowerBand || candles[i-1].close < lowerBand ? basicLower : lowerBand
+      const wasUp = isUptrend
+      isUptrend = wasUp ? candles[i].close >= lowerBand : candles[i].close > upperBand
     }
-
-    const st = trend === 1 ? lower : upper
-
-    result.push({ time: c.time, value: st, trend })
-    prevUpper = upper; prevLower = lower; prevST = st
+    supertrend = isUptrend ? lowerBand : upperBand
+    result.push({ time: candles[i].time, value: supertrend, isUptrend })
   }
-  return result.filter(Boolean)
+
+  return {
+    data: result,
+    state: { upperBand, lowerBand, isUptrend, supertrend,
+             lastAtr: atr[atr.length - 1], prevClose: candles[candles.length - 1].close }
+  }
+}
+
+function segmentByTrend(data) {
+  const segments = []
+  let seg = [], curUp = null
+  for (const pt of data) {
+    if (curUp !== null && curUp !== pt.isUptrend) {
+      segments.push({ points: seg, isUptrend: curUp })
+      seg = [{ time: pt.time, value: pt.value }]
+      curUp = pt.isUptrend
+    } else {
+      seg.push({ time: pt.time, value: pt.value })
+      curUp = pt.isUptrend
+    }
+  }
+  if (seg.length) segments.push({ points: seg, isUptrend: curUp })
+  return segments
 }
 
 function calcRSI(candles, period = 14) {
@@ -133,8 +149,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
   const containerRef = useRef(null)
   const candleSeriesRef = useRef(null)
   const volumeSeriesRef = useRef(null)
-  const stBullRef = useRef(null)
-  const stBearRef = useRef(null)
+  const stSeriesListRef = useRef([])   // [{series, isUptrend}]
+  const stStateRef = useRef(null)      // {upperBand, lowerBand, isUptrend, supertrend, lastAtr, prevClose}
   const rsiSeriesRef = useRef(null)
   const lastBarRef = useRef(null)
   const chartRef = useRef(null)
@@ -180,21 +196,11 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       if (buyLevels.stop) candleSeries.createPriceLine({ price: buyLevels.stop, color: '#ff000088', lineWidth: 2, lineStyle: 0, axisLabelVisible: false, title: '손절' })
     }
 
-    let stBull = null, stBear = null
-    if (indicators.supertrend.enabled) {
-      stBull = chart.addSeries(LineSeries, {
-        color: '#00cc66', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
-      })
-      stBear = chart.addSeries(LineSeries, {
-        color: '#ff8800', lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
-      })
-    }
-
     chartRef.current = chart
     candleSeriesRef.current = candleSeries
     volumeSeriesRef.current = volumeSeries
-    stBullRef.current = stBull
-    stBearRef.current = stBear
+    stSeriesListRef.current = []
+    stStateRef.current = null
 
     let rsiSeries = null
     if (indicators.rsi.enabled) {
@@ -223,16 +229,21 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       })))
       lastBarRef.current = { ...candles[candles.length - 1] }
 
-      if (stBull && stBear && indicators.supertrend.enabled) {
-        const st = calcSuperTrend(candles, indicators.supertrend.period, indicators.supertrend.multiplier)
-        const bullData = [], bearData = []
-        st.forEach(p => {
-          if (p.trend === 1) { bullData.push({ time: p.time, value: p.value }); bearData.push({ time: p.time, value: NaN }) }
-          else { bearData.push({ time: p.time, value: p.value }); bullData.push({ time: p.time, value: NaN }) }
+      if (indicators.supertrend.enabled && candles.length >= indicators.supertrend.period) {
+        const { data: stData, state: stState } = calcSuperTrend(
+          candles, indicators.supertrend.period, indicators.supertrend.multiplier
+        )
+        stStateRef.current = stState
+        const segments = segmentByTrend(stData)
+        stSeriesListRef.current = segments.map(seg => {
+          const s = chart.addSeries(LineSeries, {
+            color: seg.isUptrend ? '#00e676' : '#ff5252',
+            lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+          })
+          s.setData(seg.points)
+          return { series: s, isUptrend: seg.isUptrend }
         })
-        stBull.setData(bullData)
-        stBear.setData(bearData)
-        if (st.length > 0) setStTrend(st[st.length - 1].trend)
+        if (stData.length > 0) setStTrend(stData[stData.length - 1].isUptrend ? 1 : -1)
       }
 
       if (rsiSeries && indicators.rsi.enabled) {
@@ -293,21 +304,47 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       }
     }
 
-    // SuperTrend 마지막 값 증분 업데이트
+    // SuperTrend 증분 업데이트 — O(1)
     const stCfg = indicatorsRef.current?.supertrend
-    if (stBullRef.current && stBearRef.current && stCfg?.enabled && candlesRef.current.length > stCfg.period) {
-      const st = calcSuperTrend(candlesRef.current, stCfg.period, stCfg.multiplier)
-      if (st.length > 0) {
-        const last = st[st.length - 1]
-        if (last.trend === 1) {
-          stBullRef.current.update({ time: last.time, value: last.value })
-          stBearRef.current.update({ time: last.time, value: NaN })
-        } else {
-          stBearRef.current.update({ time: last.time, value: last.value })
-          stBullRef.current.update({ time: last.time, value: NaN })
-        }
-        setStTrend(last.trend)
+    if (stSeriesListRef.current.length > 0 && stStateRef.current && stCfg?.enabled) {
+      const candles = candlesRef.current
+      const st = stStateRef.current
+      const last = candles[candles.length - 1]
+      const prev = candles.length >= 2 ? candles[candles.length - 2] : last
+
+      const tr = Math.max(
+        last.high - last.low,
+        Math.abs(last.high - prev.close),
+        Math.abs(last.low - prev.close)
+      )
+      const newAtr = (st.lastAtr * (stCfg.period - 1) + tr) / stCfg.period
+      const hl2 = (last.high + last.low) / 2
+      const basicUpper = hl2 + stCfg.multiplier * newAtr
+      const basicLower = hl2 - stCfg.multiplier * newAtr
+
+      let { upperBand, lowerBand, isUptrend } = st
+      upperBand = basicUpper < upperBand || prev.close > upperBand ? basicUpper : upperBand
+      lowerBand = basicLower > lowerBand || prev.close < lowerBand ? basicLower : lowerBand
+
+      const wasUp = isUptrend
+      isUptrend = wasUp ? last.close >= lowerBand : last.close > upperBand
+      const supertrend = isUptrend ? lowerBand : upperBand
+      const point = { time: last.time, value: supertrend }
+      const lastEntry = stSeriesListRef.current[stSeriesListRef.current.length - 1]
+
+      if (wasUp === isUptrend) {
+        lastEntry.series.update(point)
+      } else {
+        lastEntry.series.update(point)  // 이전 추세선 끝점 연결
+        const newSeries = chartRef.current.addSeries(LineSeries, {
+          color: isUptrend ? '#00e676' : '#ff5252',
+          lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+        })
+        newSeries.setData([point])
+        stSeriesListRef.current.push({ series: newSeries, isUptrend })
       }
+      stStateRef.current = { upperBand, lowerBand, isUptrend, supertrend, lastAtr: newAtr, prevClose: last.close }
+      setStTrend(isUptrend ? 1 : -1)
     }
   }, [price, tf])
 
