@@ -6,6 +6,7 @@ war_engine.py의 메인 루프와 동일 프로세스에서 구동
 
 import asyncio
 import json
+from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Dict, Set
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
@@ -14,7 +15,13 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 import os
 
-app = FastAPI(title="WAR-ADAPTIVE DASHBOARD", version="2.0")
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    asyncio.create_task(push_loop())
+    yield
+
+app = FastAPI(title="WAR-ADAPTIVE DASHBOARD", version="2.0", lifespan=lifespan)
 
 # ═══════════════════════════════════════════════════════════════
 # 1. 연결된 클라이언트 관리 (멀티 디바이스 지원)
@@ -274,6 +281,9 @@ async def push_loop():
             "phase": engine_state["phase"],
             "whipsaw": engine_state["whipsaw_status"],
             "daily_pnl": engine_state["daily_pnl"],
+            "holdings": engine_state["holdings"],
+            "signals": engine_state["signals"],
+            "auto_trading": engine_state.get("auto_trading", True),
             "ts": datetime.now().isoformat(),
         }, ensure_ascii=False, default=str)
 
@@ -282,11 +292,6 @@ async def push_loop():
             prev_snapshot = snapshot
 
         await asyncio.sleep(0.1)
-
-
-@app.on_event("startup")
-async def startup():
-    asyncio.create_task(push_loop())
 
 
 # ═══════════════════════════════════════════════════════════════
