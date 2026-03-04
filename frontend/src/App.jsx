@@ -1,8 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { createChart, ColorType, CandlestickSeries, LineSeries, HistogramSeries } from 'lightweight-charts'
+import { createChart, ColorType, CandlestickSeries, HistogramSeries } from 'lightweight-charts'
 
 // ═══════════════════════════════════════════════════════════════
-// 설정
+// 설정 상수
 // ═══════════════════════════════════════════════════════════════
 
 const PREV_CLOSE = {
@@ -17,15 +17,27 @@ const STOCK_NAMES = {
   '011200': 'HMM', '028670': '팬오션', '005930': '삼성전자', '000660': 'SK하이닉스',
 }
 
-// MDI 기본 레이아웃: 6개 차트 패널 (3열 × 2행)
-const DEFAULT_PANELS = [
-  { id: 'kospi',  title: 'KOSPI 지수',  type: 'index',  code: 'KOSPI',  row: 0, col: 0 },
-  { id: '005930', title: '삼성전자',      type: 'stock',  code: '005930', row: 0, col: 1 },
-  { id: '000660', title: 'SK하이닉스',    type: 'stock',  code: '000660', row: 0, col: 2 },
-  { id: '012450', title: '한화에어로',    type: 'stock',  code: '012450', row: 1, col: 0 },
-  { id: '079550', title: 'LIG넥스원',    type: 'stock',  code: '079550', row: 1, col: 1 },
-  { id: '010950', title: '에쓰오일',      type: 'stock',  code: '010950', row: 1, col: 2 },
+// 레이아웃 정의 (cols × rows)
+const LAYOUTS = [
+  { id: '1×1', cols: 1, rows: 1 },
+  { id: '2×2', cols: 2, rows: 2 },
+  { id: '3×2', cols: 3, rows: 2 },
+  { id: '3×3', cols: 3, rows: 3 },
 ]
+
+// 최대 9개 기본 패널 (3×3용)
+const DEFAULT_CODES = [
+  'KOSPI', '005930', '000660',
+  '012450', '079550', '010950',
+  '096770', '272210', '064350',
+]
+
+function makePanels(codes) {
+  return codes.map(code => ({
+    code,
+    title: code === 'KOSPI' ? 'KOSPI 지수' : (STOCK_NAMES[code] || code),
+  }))
+}
 
 function calcQty(code, price) {
   if (!price || price <= 0) return 1
@@ -33,12 +45,11 @@ function calcQty(code, price) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 실시간 캔들 차트 컴포넌트
+// 실시간 캔들 차트 — autoSize로 컨테이너 100% 채움
 // ═══════════════════════════════════════════════════════════════
 
-function RealtimeChart({ code, title, price, prevPrice, whipsaw, onBuy, onSell }) {
+function RealtimeChart({ code, title, price, prevPrice, whipsaw, focused, onFocus, onBuy, onSell }) {
   const containerRef = useRef(null)
-  const chartRef = useRef(null)
   const candleSeriesRef = useRef(null)
   const volumeSeriesRef = useRef(null)
   const lastBarRef = useRef(null)
@@ -47,12 +58,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, onBuy, onSell }
   useEffect(() => {
     if (!containerRef.current) return
 
-    // 높이 보호 — 컨테이너가 아직 렌더링되지 않았으면 최소값 보장
-    const cw = containerRef.current.clientWidth || 300
-    const ch = containerRef.current.clientHeight
-    const chartHeight = Math.max(ch - 36, 100)
-
     const chart = createChart(containerRef.current, {
+      autoSize: true,   // ★ 컨테이너 크기에 자동 맞춤 — 수동 resize 불필요
       layout: {
         background: { type: ColorType.Solid, color: '#0a0a0a' },
         textColor: '#888',
@@ -62,8 +69,6 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, onBuy, onSell }
         vertLines: { color: '#1a1a2e' },
         horzLines: { color: '#1a1a2e' },
       },
-      width: cw,
-      height: chartHeight,
       timeScale: {
         timeVisible: true,
         secondsVisible: true,
@@ -98,7 +103,6 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, onBuy, onSell }
       scaleMargins: { top: 0.85, bottom: 0 },
     })
 
-    // 전일 종가 기준선
     if (prevPrice && prevPrice > 0) {
       candleSeries.createPriceLine({
         price: prevPrice,
@@ -110,12 +114,11 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, onBuy, onSell }
       })
     }
 
-    chartRef.current = chart
     candleSeriesRef.current = candleSeries
     volumeSeriesRef.current = volumeSeries
 
-    // 과거 캔들 시드 로드 (snapshot의 candle_history)
-    if (window.__CANDLE_HISTORY && window.__CANDLE_HISTORY[code]) {
+    // 과거 캔들 시드
+    if (window.__CANDLE_HISTORY?.[code]) {
       const hist = window.__CANDLE_HISTORY[code]
       candleSeries.setData(hist)
       volumeSeries.setData(hist.map(c => ({
@@ -123,26 +126,11 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, onBuy, onSell }
         value: c.volume || 0,
         color: c.close >= c.open ? '#ef535066' : '#2962ff66',
       })))
-      if (hist.length > 0) {
-        lastBarRef.current = { ...hist[hist.length - 1] }
-      }
+      if (hist.length > 0) lastBarRef.current = { ...hist[hist.length - 1] }
     }
 
-    const handleResize = () => {
-      if (containerRef.current) {
-        chart.applyOptions({
-          width: containerRef.current.clientWidth || 300,
-          height: Math.max(containerRef.current.clientHeight - 36, 100),
-        })
-      }
-    }
-    window.addEventListener('resize', handleResize)
-
-    return () => {
-      window.removeEventListener('resize', handleResize)
-      chart.remove()
-    }
-  }, [prevPrice])
+    return () => chart.remove()
+  }, [code, prevPrice])
 
   // 실시간 틱 → 1분봉 누적
   useEffect(() => {
@@ -176,53 +164,59 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, onBuy, onSell }
   const flagColor = {
     emergency: '#ff0000', crash: '#ff4444', near_limit: '#ffaa00', normal: '#00cc66'
   }[whipsaw?.flag] || '#333'
+  const borderColor = focused ? '#ffcc00' : flagColor
   const isBuyDisabled = whipsaw?.flag === 'near_limit' || whipsaw?.flag === 'emergency'
 
   return (
-    <div style={{
-      display: 'flex', flexDirection: 'column',
-      border: `1px solid ${flagColor}`, borderRadius: 2,
-      background: '#0a0a0a', overflow: 'hidden', minHeight: 0,
-    }}>
-      {/* 헤더 */}
+    <div
+      onClick={onFocus}
+      style={{
+        display: 'flex', flexDirection: 'column',
+        border: `${focused ? 2 : 1}px solid ${borderColor}`,
+        borderRadius: 2, background: '#0a0a0a',
+        overflow: 'hidden', height: '100%', cursor: 'pointer',
+      }}
+    >
+      {/* 헤더 32px */}
       <div style={{
-        display: 'flex', alignItems: 'center', gap: 8,
-        padding: '3px 8px', background: '#111', borderBottom: `2px solid ${flagColor}`,
+        display: 'flex', alignItems: 'center', gap: 6,
+        padding: '2px 6px', background: focused ? '#1a1500' : '#111',
+        borderBottom: `2px solid ${borderColor}`,
         height: 32, flexShrink: 0,
       }}>
-        <span style={{ fontWeight: 'bold', fontSize: 12, color: '#eee', minWidth: 70 }}>{title}</span>
-        <span style={{ fontSize: 13, fontWeight: 'bold', color: chgColor }}>
+        <span style={{ fontWeight: 'bold', fontSize: 11, color: focused ? '#ffcc00' : '#eee', minWidth: 60 }}>{title}</span>
+        <span style={{ fontSize: 12, fontWeight: 'bold', color: chgColor }}>
           {price?.toLocaleString()}
         </span>
-        <span style={{ fontSize: 11, color: chgColor }}>
+        <span style={{ fontSize: 10, color: chgColor }}>
           {chg >= 0 ? '+' : ''}{chg.toFixed(2)}%
         </span>
         {whipsaw?.drawdown_pct ? (
-          <span style={{ fontSize: 10, color: '#ff8888' }}>↓{whipsaw.drawdown_pct}%</span>
+          <span style={{ fontSize: 9, color: '#ff8888' }}>↓{whipsaw.drawdown_pct}%</span>
         ) : null}
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 4 }}>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 3 }} onClick={e => e.stopPropagation()}>
           <button onClick={onBuy} disabled={isBuyDisabled}
             style={{
               background: '#003300', color: '#0f0', border: '1px solid #060',
-              padding: '1px 6px', fontSize: 10, cursor: 'pointer', borderRadius: 2,
+              padding: '1px 5px', fontSize: 9, cursor: 'pointer', borderRadius: 2,
               opacity: isBuyDisabled ? 0.3 : 1,
             }}>매수</button>
           <button onClick={onSell}
             style={{
               background: '#330000', color: '#f44', border: '1px solid #600',
-              padding: '1px 6px', fontSize: 10, cursor: 'pointer', borderRadius: 2,
+              padding: '1px 5px', fontSize: 9, cursor: 'pointer', borderRadius: 2,
             }}>매도</button>
         </div>
       </div>
 
-      {/* 차트 영역 */}
+      {/* 차트 — flex: 1로 남은 높이 전부 사용, autoSize가 실제 픽셀 계산 */}
       <div ref={containerRef} style={{ flex: 1, minHeight: 0 }} />
     </div>
   )
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 매크로 바 (상단)
+// 매크로 바
 // ═══════════════════════════════════════════════════════════════
 
 function MacroBar({ state }) {
@@ -236,8 +230,8 @@ function MacroBar({ state }) {
 
   return (
     <div style={{
-      display: 'flex', alignItems: 'center', gap: 16, padding: '4px 12px',
-      background: '#0d0d1a', borderBottom: '1px solid #222', fontSize: 12, flexWrap: 'wrap',
+      display: 'flex', alignItems: 'center', gap: 16, padding: '3px 12px',
+      background: '#0d0d1a', borderBottom: '1px solid #222', fontSize: 11, flexWrap: 'wrap', flexShrink: 0,
     }}>
       <span style={{ color: regimeColors[regime] || '#888', fontWeight: 'bold' }}>● {regime}</span>
       <span>β <b>{beta?.toFixed(2)}</b></span>
@@ -268,8 +262,8 @@ function WhipsawBanner({ status, phase }) {
 
   return (
     <div style={{
-      display: 'flex', gap: 12, padding: '3px 12px', flexWrap: 'wrap',
-      background: '#1a0000', borderBottom: '1px solid #330000', fontSize: 11,
+      display: 'flex', gap: 12, padding: '2px 12px', flexWrap: 'wrap', flexShrink: 0,
+      background: '#1a0000', borderBottom: '1px solid #330000', fontSize: 10,
     }}>
       <span style={{ color: '#ff8888' }}>요동장 [{phase}]</span>
       {items.map(([code, v]) => (
@@ -283,42 +277,58 @@ function WhipsawBanner({ status, phase }) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-// 우측 사이드 패널: 보유종목 + 시그널 + 차트 배치 변경기
+// 우측 사이드 패널
 // ═══════════════════════════════════════════════════════════════
 
-function SidePanel({ state, panels, onChangePanel }) {
+function SidePanel({ state, panels, focusedIdx, onChangeFocused, onChangePanel }) {
   const signals = state?.signals || []
   const holdings = state?.holdings || []
   const actionColor = { BUY: '#0c6', SELL: '#f44', HOLD: '#888' }
 
   return (
     <div style={{
-      width: 280, display: 'flex', flexDirection: 'column',
-      borderLeft: '1px solid #222', background: '#0a0a0a', overflow: 'hidden',
+      width: 240, display: 'flex', flexDirection: 'column',
+      borderLeft: '1px solid #222', background: '#0a0a0a', overflow: 'hidden', flexShrink: 0,
     }}>
-      {/* 차트 배치 변경기 */}
+      {/* ★ 포커스 차트 종목 선택기 */}
       <div style={{ padding: '6px 8px', borderBottom: '1px solid #222' }}>
-        <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>차트 배치 변경</div>
-        {panels.map((p, i) => (
-          <div key={p.id} style={{ display: 'flex', alignItems: 'center', gap: 4, marginBottom: 2 }}>
-            <span style={{ fontSize: 10, color: '#888', width: 14 }}>{i + 1}</span>
-            <select value={p.code} onChange={e => onChangePanel(i, e.target.value)}
+        <div style={{ fontSize: 10, color: '#ffcc00', marginBottom: 4 }}>
+          포커스 차트 [{focusedIdx + 1}번] 종목
+        </div>
+        <select value={panels[focusedIdx]?.code || 'KOSPI'}
+          onChange={e => onChangePanel(focusedIdx, e.target.value)}
+          style={{
+            width: '100%', background: '#1a1500', color: '#ffcc00',
+            border: '1px solid #665500', fontSize: 11, padding: '3px 4px',
+          }}>
+          <option value="KOSPI">KOSPI 지수</option>
+          {Object.entries(STOCK_NAMES).map(([c, n]) => (
+            <option key={c} value={c}>{n} ({c})</option>
+          ))}
+        </select>
+      </div>
+
+      {/* 패널 목록 (클릭으로 포커스) */}
+      <div style={{ padding: '4px 8px', borderBottom: '1px solid #222' }}>
+        <div style={{ fontSize: 10, color: '#666', marginBottom: 3 }}>차트 패널 (클릭=포커스)</div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3 }}>
+          {panels.map((p, i) => (
+            <button key={i} onClick={() => onChangeFocused(i)}
               style={{
-                flex: 1, background: '#111', color: '#ccc', border: '1px solid #333',
-                fontSize: 10, padding: '1px 4px',
+                fontSize: 9, padding: '1px 5px', cursor: 'pointer', borderRadius: 2,
+                background: i === focusedIdx ? '#1a1500' : '#111',
+                color: i === focusedIdx ? '#ffcc00' : '#888',
+                border: `1px solid ${i === focusedIdx ? '#665500' : '#333'}`,
               }}>
-              <option value="KOSPI">KOSPI 지수</option>
-              {Object.entries(STOCK_NAMES).map(([c, n]) => (
-                <option key={c} value={c}>{n} ({c})</option>
-              ))}
-            </select>
-          </div>
-        ))}
+              {i + 1}.{p.title}
+            </button>
+          ))}
+        </div>
       </div>
 
       {/* 보유종목 */}
-      <div style={{ padding: '6px 8px', borderBottom: '1px solid #222' }}>
-        <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>보유종목</div>
+      <div style={{ padding: '5px 8px', borderBottom: '1px solid #222' }}>
+        <div style={{ fontSize: 10, color: '#666', marginBottom: 3 }}>보유종목</div>
         {holdings.length === 0
           ? <div style={{ fontSize: 10, color: '#444' }}>없음</div>
           : holdings.map(h => (
@@ -333,10 +343,10 @@ function SidePanel({ state, panels, onChangePanel }) {
       </div>
 
       {/* 시그널 로그 */}
-      <div style={{ flex: 1, overflow: 'auto', padding: '6px 8px' }}>
-        <div style={{ fontSize: 10, color: '#666', marginBottom: 4 }}>시그널 로그</div>
-        {signals.slice(0, 80).map((s, i) => (
-          <div key={i} style={{ fontSize: 10, color: '#aaa', lineHeight: 1.5 }}>
+      <div style={{ flex: 1, overflow: 'auto', padding: '5px 8px' }}>
+        <div style={{ fontSize: 10, color: '#666', marginBottom: 3 }}>시그널 로그</div>
+        {signals.slice(0, 100).map((s, i) => (
+          <div key={i} style={{ fontSize: 9, color: '#aaa', lineHeight: 1.5 }}>
             <span style={{ color: actionColor[s.action] || '#888' }}>[{s.action}]</span>{' '}
             {s.name} {s.price?.toLocaleString()} × {s.qty} — {s.reason}
           </div>
@@ -353,10 +363,15 @@ function SidePanel({ state, panels, onChangePanel }) {
 export default function TradingDashboard() {
   const [state, setState] = useState(null)
   const [connected, setConnected] = useState(false)
-  const [panels, setPanels] = useState(DEFAULT_PANELS)
+  const [layoutIdx, setLayoutIdx] = useState(2)          // 기본 3×2
+  const [panels, setPanels] = useState(makePanels(DEFAULT_CODES))
+  const [focusedIdx, setFocusedIdx] = useState(0)
   const ws = useRef(null)
 
-  // WebSocket 연결 + 자동 재연결
+  const layout = LAYOUTS[layoutIdx]
+  const visibleCount = layout.cols * layout.rows
+
+  // WebSocket 연결
   useEffect(() => {
     let reconnectTimer = null
 
@@ -371,9 +386,7 @@ export default function TradingDashboard() {
       ws.current.onmessage = (e) => {
         const msg = JSON.parse(e.data)
         if (msg.type === 'snapshot') {
-          if (msg.data.candle_history) {
-            window.__CANDLE_HISTORY = msg.data.candle_history
-          }
+          if (msg.data.candle_history) window.__CANDLE_HISTORY = msg.data.candle_history
           setState(msg.data)
         }
         if (msg.type === 'update') {
@@ -422,8 +435,10 @@ export default function TradingDashboard() {
   const handleChangePanel = useCallback((index, newCode) => {
     setPanels(prev => {
       const next = [...prev]
-      const name = newCode === 'KOSPI' ? 'KOSPI 지수' : (STOCK_NAMES[newCode] || newCode)
-      next[index] = { ...next[index], code: newCode, title: name, type: newCode === 'KOSPI' ? 'index' : 'stock' }
+      next[index] = {
+        code: newCode,
+        title: newCode === 'KOSPI' ? 'KOSPI 지수' : (STOCK_NAMES[newCode] || newCode),
+      }
       return next
     })
   }, [])
@@ -434,17 +449,14 @@ export default function TradingDashboard() {
         display: 'flex', alignItems: 'center', justifyContent: 'center',
         height: '100vh', color: '#555', fontSize: 14, background: '#0a0a0a',
       }}>
-        {connected ? '데이터 수신 중...' : '🔴 서버 연결 중... (war_engine.py 실행 확인)'}
+        {connected ? '데이터 수신 중...' : '🔴 서버 연결 중... (war_engine.py 또는 demo_server.py 실행 확인)'}
       </div>
     )
   }
 
   const prices = state.prices || {}
   const whipsawStatus = state.whipsaw_status || {}
-  const rows = [
-    panels.filter(p => p.row === 0),
-    panels.filter(p => p.row === 1),
-  ]
+  const visiblePanels = panels.slice(0, visibleCount)
 
   return (
     <div style={{
@@ -457,12 +469,24 @@ export default function TradingDashboard() {
 
       {/* 컨트롤 바 */}
       <div style={{
-        display: 'flex', gap: 8, padding: '3px 12px', background: '#111',
-        borderBottom: '1px solid #222', alignItems: 'center',
+        display: 'flex', gap: 6, padding: '2px 10px', background: '#111',
+        borderBottom: '1px solid #222', alignItems: 'center', flexShrink: 0,
       }}>
+        {/* 레이아웃 선택 버튼 */}
+        {LAYOUTS.map((l, i) => (
+          <button key={l.id} onClick={() => { setLayoutIdx(i); setFocusedIdx(0) }}
+            style={{
+              fontSize: 10, padding: '1px 7px', cursor: 'pointer', borderRadius: 2,
+              background: i === layoutIdx ? '#003366' : '#111',
+              color: i === layoutIdx ? '#66aaff' : '#666',
+              border: `1px solid ${i === layoutIdx ? '#336699' : '#333'}`,
+              fontWeight: i === layoutIdx ? 'bold' : 'normal',
+            }}>{l.id}</button>
+        ))}
+        <div style={{ width: 1, height: 14, background: '#333', margin: '0 2px' }} />
         <button onClick={() => send({ cmd: 'toggle_auto', enabled: !state.auto_trading })}
           style={{
-            fontSize: 10, padding: '2px 8px', cursor: 'pointer', borderRadius: 2,
+            fontSize: 10, padding: '1px 7px', cursor: 'pointer', borderRadius: 2,
             background: state.auto_trading ? '#030' : '#300',
             color: state.auto_trading ? '#0f0' : '#f66',
             border: '1px solid #444',
@@ -471,46 +495,58 @@ export default function TradingDashboard() {
         </button>
         <button onClick={() => send({ cmd: 'cancel_all' })}
           style={{
-            fontSize: 10, padding: '2px 8px', cursor: 'pointer', borderRadius: 2,
+            fontSize: 10, padding: '1px 7px', cursor: 'pointer', borderRadius: 2,
             background: '#210', color: '#fa4', border: '1px solid #432',
           }}>전체취소</button>
+        <span style={{ fontSize: 9, color: '#444', marginLeft: 4 }}>
+          차트 클릭 → 포커스 → 우측에서 종목 변경
+        </span>
       </div>
 
-      {/* 메인 영역: 차트 그리드 + 사이드 패널 */}
-      <div style={{ display: 'flex', flex: 1, overflow: 'hidden' }}>
-        {/* 차트 그리드 (3×2) */}
+      {/* 메인 영역 */}
+      <div style={{ display: 'flex', flex: 1, overflow: 'hidden', minHeight: 0 }}>
+        {/* ★ 차트 그리드 — CSS grid로 정확한 cols×rows 분할 */}
         <div style={{
-          flex: 1, display: 'flex', flexDirection: 'column',
-          gap: 2, padding: 2, overflow: 'hidden',
+          flex: 1,
+          display: 'grid',
+          gridTemplateColumns: `repeat(${layout.cols}, 1fr)`,
+          gridTemplateRows: `repeat(${layout.rows}, 1fr)`,
+          gap: 2,
+          padding: 2,
+          overflow: 'hidden',
+          minHeight: 0,
         }}>
-          {rows.map((row, ri) => (
-            <div key={ri} style={{ display: 'flex', flex: 1, gap: 2, minHeight: 0 }}>
-              {row.map(panel => {
-                const code = panel.code
-                const price = code === 'KOSPI' ? (state.kospi || 0) : (prices[code] || 0)
-                const prev = PREV_CLOSE[code] || 0
-                const whipsaw = whipsawStatus[code]
+          {visiblePanels.map((panel, idx) => {
+            const code = panel.code
+            const price = code === 'KOSPI' ? (state.kospi || 0) : (prices[code] || 0)
+            const prev = PREV_CLOSE[code] || 0
+            const whipsaw = whipsawStatus[code]
 
-                return (
-                  <div key={panel.id} style={{ flex: 1, display: 'flex', flexDirection: 'column', minWidth: 0 }}>
-                    <RealtimeChart
-                      code={code}
-                      title={panel.title}
-                      price={price}
-                      prevPrice={prev}
-                      whipsaw={whipsaw}
-                      onBuy={() => handleBuy(code, price)}
-                      onSell={() => handleSell(code)}
-                    />
-                  </div>
-                )
-              })}
-            </div>
-          ))}
+            return (
+              <RealtimeChart
+                key={`${code}-${idx}`}
+                code={code}
+                title={panel.title}
+                price={price}
+                prevPrice={prev}
+                whipsaw={whipsaw}
+                focused={idx === focusedIdx}
+                onFocus={() => setFocusedIdx(idx)}
+                onBuy={() => handleBuy(code, price)}
+                onSell={() => handleSell(code)}
+              />
+            )
+          })}
         </div>
 
         {/* 우측 사이드 패널 */}
-        <SidePanel state={state} panels={panels} onChangePanel={handleChangePanel} />
+        <SidePanel
+          state={state}
+          panels={visiblePanels}
+          focusedIdx={focusedIdx}
+          onChangeFocused={setFocusedIdx}
+          onChangePanel={handleChangePanel}
+        />
       </div>
     </div>
   )
