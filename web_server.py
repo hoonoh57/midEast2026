@@ -73,6 +73,9 @@ engine_state: Dict = {
     "whipsaw_status": {},   # {code: {flag, session_high, current, drawdown_pct}}
     "daily_pnl": 0,
     "phase": "stabilization",
+    "kospi": 0,
+    "auto_trading": True,
+    "candle_history": {},   # {code: [{time,open,high,low,close,volume}]}
 }
 
 
