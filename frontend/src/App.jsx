@@ -106,9 +106,8 @@ function calcRSI(candles, period = 14) {
   let avgGain = 0, avgLoss = 0
 
   for (let i = 0; i < candles.length; i++) {
-    // null 대신 whitespace({time만}) 사용 → 메인 차트와 시간 격자 일치
-    if (i === 0) { result.push({ time: candles[i].time }); continue }
-    const change = candles[i].close - candles[i-1].close
+    if (i === 0) { result.push({ time: candles[i].time, value: NaN }); continue }
+    const change = candles[i].close - candles[i - 1].close
     const gain = change > 0 ? change : 0
     const loss = change < 0 ? -change : 0
 
@@ -118,7 +117,9 @@ function calcRSI(candles, period = 14) {
         avgGain /= period; avgLoss /= period
         const rs = avgLoss === 0 ? 100 : avgGain / avgLoss
         result.push({ time: candles[i].time, value: Math.round(100 - 100 / (1 + rs)) })
-      } else { result.push({ time: candles[i].time }) }
+      } else {
+        result.push({ time: candles[i].time, value: NaN })
+      }
     } else {
       avgGain = (avgGain * (period - 1) + gain) / period
       avgLoss = (avgLoss * (period - 1) + loss) / period
@@ -126,7 +127,7 @@ function calcRSI(candles, period = 14) {
       result.push({ time: candles[i].time, value: Math.round(100 - 100 / (1 + rs)) })
     }
   }
-  return result  // whitespace 포함, filter 없음
+  return result  // candles.length와 동일한 길이, 빈 곳은 NaN
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -205,7 +206,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         autoSize: true,
         layout: { background: { type: ColorType.Solid, color: '#080810' }, textColor: '#666', fontSize: 9 },
         grid: { vertLines: { color: '#141428' }, horzLines: { color: '#141428' } },
-        timeScale: { visible: false },
+        timeScale: { visible: false, rightOffset: 5 },
         rightPriceScale: { borderColor: '#222', scaleMargins: { top: 0.05, bottom: 0.05 } },
         crosshair: { vertLine: { visible: false }, horzLine: { color: '#444', style: 2 } },
         handleScroll: false, handleScale: false,
@@ -257,7 +258,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         const rsi = calcRSI(candles, indicators.rsi.period)
         rsiSeries.setData(rsi)
         const lastRsi = rsi[rsi.length - 1]
-        if (lastRsi?.value !== undefined) setRsiValue(lastRsi.value)
+        if (lastRsi && !isNaN(lastRsi.value)) setRsiValue(lastRsi.value)
       }
       if (rsiChart) {
         requestAnimationFrame(() => {
@@ -314,17 +315,17 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
     if (rsiSeriesRef.current && rsiCfg?.enabled && candlesRef.current.length > rsiCfg.period) {
       const rsiData = calcRSI(candlesRef.current, rsiCfg.period)
       const lastRsi = rsiData[rsiData.length - 1]
-      if (lastRsi?.value !== undefined) {
+      if (lastRsi && !isNaN(lastRsi.value)) {
         rsiSeriesRef.current.update(lastRsi)
         setRsiValue(lastRsi.value)
-        // rAF: lightweight-charts 내부 auto-scroll rAF 이후에 sync 실행
-        requestAnimationFrame(() => {
-          try {
-            const range = chartRef.current?.timeScale()?.getVisibleLogicalRange()
-            if (range && rsiChartRef.current) rsiChartRef.current.timeScale().setVisibleLogicalRange(range)
-          } catch(_) {}
-        })
       }
+      // rAF: LWC auto-scroll rAF 이후 논리 범위 동기화 (항상 실행)
+      requestAnimationFrame(() => {
+        try {
+          const range = chartRef.current?.timeScale()?.getVisibleLogicalRange()
+          if (range && rsiChartRef.current) rsiChartRef.current.timeScale().setVisibleLogicalRange(range)
+        } catch(_) {}
+      })
     }
 
     // SuperTrend 마지막 값 증분 업데이트
