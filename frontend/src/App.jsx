@@ -150,12 +150,13 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
 
   useEffect(() => {
     if (!containerRef.current) return
+    if (tf !== 'm1' && candleData == null) return  // fetch 완료 전 빈 차트 방지
 
     const chart = createChart(containerRef.current, {
       autoSize: true,
       layout: { background: { type: ColorType.Solid, color: '#0a0a0a' }, textColor: '#888', fontSize: 10 },
       grid: { vertLines: { color: '#1a1a2e' }, horzLines: { color: '#1a1a2e' } },
-      timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#333', tickMarkFormatter: kstTimeFormatter },
+      timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#333', tickMarkFormatter: kstTimeFormatter, rightOffset: 5 },
       localization: { timeFormatter: kstTimeFormatter },
       rightPriceScale: { borderColor: '#333', scaleMargins: { top: 0.05, bottom: 0.25 } },
       crosshair: { mode: 0, vertLine: { color: '#555', style: 2 }, horzLine: { color: '#555', style: 2 } },
@@ -203,7 +204,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         autoSize: true,
         layout: { background: { type: ColorType.Solid, color: '#080810' }, textColor: '#666', fontSize: 9 },
         grid: { vertLines: { color: '#141428' }, horzLines: { color: '#141428' } },
-        timeScale: { visible: false },
+        timeScale: { visible: false, rightOffset: 5 },
         rightPriceScale: { borderColor: '#222', scaleMargins: { top: 0.05, bottom: 0.05 } },
         crosshair: { vertLine: { visible: false }, horzLine: { color: '#444', style: 2 } },
         handleScroll: false, handleScale: false,
@@ -216,7 +217,9 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       rsiSeries.createPriceLine({ price: 50, color: '#ffffff22', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })
 
       chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-        if (range && rsiChart) rsiChart.timeScale().setVisibleLogicalRange(range)
+        if (range && rsiChart) {
+          try { rsiChart.timeScale().setVisibleLogicalRange(range) } catch(_) {}
+        }
       })
     }
     rsiChartRef.current = rsiChart
@@ -253,6 +256,14 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         const rsi = calcRSI(candles, indicators.rsi.period)
         rsiSeries.setData(rsi)
         if (rsi.length > 0) setRsiValue(rsi[rsi.length - 1].value)
+      }
+      if (rsiChart) {
+        requestAnimationFrame(() => {
+          try {
+            const range = chart.timeScale().getVisibleLogicalRange()
+            if (range) rsiChart.timeScale().setVisibleLogicalRange(range)
+          } catch(_) {}
+        })
       }
     }
 
@@ -304,6 +315,10 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         const last = rsiData[rsiData.length - 1]
         rsiSeriesRef.current.update(last)
         setRsiValue(last.value)
+        try {
+          const range = chartRef.current?.timeScale()?.getVisibleLogicalRange()
+          if (range && rsiChartRef.current) rsiChartRef.current.timeScale().setVisibleLogicalRange(range)
+        } catch(_) {}
       }
     }
   }, [price, tf])
@@ -674,31 +689,23 @@ export default function TradingDashboard() {
   const layout = LAYOUTS[layoutIdx]
   const visibleCount = layout.cols * layout.rows
 
-  const fetchCandles = useCallback(async (newTF, currentPanels) => {
-    if (newTF === 'm1') {
-      setCandleCache(prev => { const next = {...prev}; delete next['m1']; return next })
-      return
-    }
-    const codes = currentPanels.map(p => p.code).join(',')
+  // fetch 완료 후 setTF → 차트 렌더 시 candleData 항상 존재 (빈 차트 방지)
+  const handleChangeTF = useCallback(async (newTF) => {
+    if (newTF === tf) return
+    if (newTF === 'm1') { setCandleCache({}); setTF('m1'); return }
+    const codes = panels.slice(0, visibleCount).map(p => p.code).join(',')
     try {
       const resp = await fetch(`/api/candles_batch?codes=${codes}&tf=${newTF}`)
-      const data = await resp.json()
-      setCandleCache(prev => ({ ...prev, [newTF]: data.candles }))
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      const json = await resp.json()
+      if (json.candles && typeof json.candles === 'object') {
+        setCandleCache({ [newTF]: json.candles })
+        setTF(newTF)
+      }
     } catch(e) {
-      console.error('캔들 다운로드 실패:', e)
+      console.error('TF 전환 실패:', e)
     }
-  }, [])
-
-  const handleChangeTF = useCallback((newTF) => {
-    setTF(newTF)
-  }, [])
-
-  // tf 변경 시 자동 fetch (버튼 클릭 + 키보드 단축키 모두 처리)
-  const tfInitRef = useRef(false)
-  useEffect(() => {
-    if (!tfInitRef.current) { tfInitRef.current = true; return }
-    fetchCandles(tf, panels.slice(0, visibleCount))
-  }, [tf])
+  }, [tf, panels, visibleCount])
 
   // WebSocket
   useEffect(() => {
@@ -763,14 +770,14 @@ export default function TradingDashboard() {
       } else if (e.key === 'Escape') {
         setSellConfirm(null)
       } else if (e.key === ']') {
-        setTF(prev => { const i = TIMEFRAMES.indexOf(prev); return TIMEFRAMES[Math.min(i + 1, TIMEFRAMES.length - 1)] })
+        const i = TIMEFRAMES.indexOf(tf); if (i < TIMEFRAMES.length - 1) handleChangeTF(TIMEFRAMES[i + 1])
       } else if (e.key === '[') {
-        setTF(prev => { const i = TIMEFRAMES.indexOf(prev); return TIMEFRAMES[Math.max(i - 1, 0)] })
+        const i = TIMEFRAMES.indexOf(tf); if (i > 0) handleChangeTF(TIMEFRAMES[i - 1])
       }
     }
     window.addEventListener('keydown', handler)
     return () => window.removeEventListener('keydown', handler)
-  }, [visibleCount])
+  }, [visibleCount, tf, handleChangeTF])
 
   const send = useCallback((payload) => {
     if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify(payload))
