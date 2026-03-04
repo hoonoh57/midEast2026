@@ -321,6 +321,23 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         } catch(_) {}
       }
     }
+
+    // SuperTrend 마지막 값 증분 업데이트
+    const stCfg = indicatorsRef.current?.supertrend
+    if (stBullRef.current && stBearRef.current && stCfg?.enabled && candlesRef.current.length > stCfg.period) {
+      const st = calcSuperTrend(candlesRef.current, stCfg.period, stCfg.multiplier)
+      if (st.length > 0) {
+        const last = st[st.length - 1]
+        if (last.trend === 1) {
+          stBullRef.current.update({ time: last.time, value: last.value })
+          stBearRef.current.update({ time: last.time, value: NaN })
+        } else {
+          stBearRef.current.update({ time: last.time, value: last.value })
+          stBullRef.current.update({ time: last.time, value: NaN })
+        }
+        setStTrend(last.trend)
+      }
+    }
   }, [price, tf])
 
   const chg = prevPrice > 0 ? ((price - prevPrice) / prevPrice * 100) : 0
