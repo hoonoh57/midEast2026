@@ -102,32 +102,27 @@ function calcSuperTrend(candles, period = 10, multiplier = 3) {
 }
 
 function calcRSI(candles, period = 14) {
+  if (candles.length < period + 1) return []
   const result = []
   let avgGain = 0, avgLoss = 0
 
-  for (let i = 0; i < candles.length; i++) {
-    if (i === 0) { result.push({ time: candles[i].time, value: NaN }); continue }
+  for (let i = 1; i <= period; i++) {
     const change = candles[i].close - candles[i - 1].close
-    const gain = change > 0 ? change : 0
-    const loss = change < 0 ? -change : 0
-
-    if (i <= period) {
-      avgGain += gain; avgLoss += loss
-      if (i === period) {
-        avgGain /= period; avgLoss /= period
-        const rs = avgLoss === 0 ? 100 : avgGain / avgLoss
-        result.push({ time: candles[i].time, value: Math.round(100 - 100 / (1 + rs)) })
-      } else {
-        result.push({ time: candles[i].time, value: NaN })
-      }
-    } else {
-      avgGain = (avgGain * (period - 1) + gain) / period
-      avgLoss = (avgLoss * (period - 1) + loss) / period
-      const rs = avgLoss === 0 ? 100 : avgGain / avgLoss
-      result.push({ time: candles[i].time, value: Math.round(100 - 100 / (1 + rs)) })
-    }
+    avgGain += change > 0 ? change : 0
+    avgLoss += change < 0 ? -change : 0
   }
-  return result  // candles.length와 동일한 길이, 빈 곳은 NaN
+  avgGain /= period; avgLoss /= period
+  const rs0 = avgLoss === 0 ? 100 : avgGain / avgLoss
+  result.push({ time: candles[period].time, value: Math.round(100 - 100 / (1 + rs0)) })
+
+  for (let i = period + 1; i < candles.length; i++) {
+    const change = candles[i].close - candles[i - 1].close
+    avgGain = (avgGain * (period - 1) + (change > 0 ? change : 0)) / period
+    avgLoss = (avgLoss * (period - 1) + (change < 0 ? -change : 0)) / period
+    const rs = avgLoss === 0 ? 100 : avgGain / avgLoss
+    result.push({ time: candles[i].time, value: Math.round(100 - 100 / (1 + rs)) })
+  }
+  return result
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -136,7 +131,6 @@ function calcRSI(candles, period = 14) {
 
 function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focused, onFocus, onBuy, onSell, tf, indicators, candleData, chartKey, onChartReady, onChartDestroy }) {
   const containerRef = useRef(null)
-  const rsiContainerRef = useRef(null)
   const candleSeriesRef = useRef(null)
   const volumeSeriesRef = useRef(null)
   const stBullRef = useRef(null)
@@ -144,7 +138,6 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
   const rsiSeriesRef = useRef(null)
   const lastBarRef = useRef(null)
   const chartRef = useRef(null)
-  const rsiChartRef = useRef(null)
   const candlesRef = useRef([])        // 현재 캔들 데이터 (RSI 실시간 계산용)
   const indicatorsRef = useRef(indicators) // 최신 indicators 참조 (stale closure 방지)
   const [rsiValue, setRsiValue] = useState(null)
@@ -156,7 +149,10 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
 
     const chart = createChart(containerRef.current, {
       autoSize: true,
-      layout: { background: { type: ColorType.Solid, color: '#0a0a0a' }, textColor: '#888', fontSize: 10 },
+      layout: {
+        background: { type: ColorType.Solid, color: '#0a0a0a' }, textColor: '#888', fontSize: 10,
+        panes: { separatorColor: '#222', enableResize: true },
+      },
       grid: { vertLines: { color: '#1a1a2e' }, horzLines: { color: '#1a1a2e' } },
       timeScale: { timeVisible: true, secondsVisible: false, borderColor: '#333', tickMarkFormatter: kstTimeFormatter, rightOffset: 5 },
       localization: { timeFormatter: kstTimeFormatter },
@@ -200,31 +196,16 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
     stBullRef.current = stBull
     stBearRef.current = stBear
 
-    let rsiChart = null, rsiSeries = null
-    if (indicators.rsi.enabled && rsiContainerRef.current) {
-      rsiChart = createChart(rsiContainerRef.current, {
-        autoSize: true,
-        layout: { background: { type: ColorType.Solid, color: '#080810' }, textColor: '#666', fontSize: 9 },
-        grid: { vertLines: { color: '#141428' }, horzLines: { color: '#141428' } },
-        timeScale: { visible: false, rightOffset: 5 },
-        rightPriceScale: { borderColor: '#222', scaleMargins: { top: 0.05, bottom: 0.05 } },
-        crosshair: { vertLine: { visible: false }, horzLine: { color: '#444', style: 2 } },
-        handleScroll: false, handleScale: false,
-      })
-      rsiSeries = rsiChart.addSeries(LineSeries, {
+    let rsiSeries = null
+    if (indicators.rsi.enabled) {
+      rsiSeries = chart.addSeries(LineSeries, {
         color: '#e0aa00', lineWidth: 1.5, priceLineVisible: false, lastValueVisible: true, crosshairMarkerVisible: false,
-      })
+      }, 1)
       rsiSeries.createPriceLine({ price: 70, color: '#ff444466', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })
       rsiSeries.createPriceLine({ price: 30, color: '#00cc6666', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })
       rsiSeries.createPriceLine({ price: 50, color: '#ffffff22', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })
-
-      chart.timeScale().subscribeVisibleLogicalRangeChange((range) => {
-        if (range && rsiChart) {
-          try { rsiChart.timeScale().setVisibleLogicalRange(range) } catch(_) {}
-        }
-      })
+      try { chart.panes()[1]?.setHeight(80) } catch(_) {}
     }
-    rsiChartRef.current = rsiChart
     rsiSeriesRef.current = rsiSeries
 
     // m1: __CANDLE_HISTORY 시드 사용 / 그 외: 서버에서 받은 candleData만 사용
@@ -258,15 +239,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         const rsi = calcRSI(candles, indicators.rsi.period)
         rsiSeries.setData(rsi)
         const lastRsi = rsi[rsi.length - 1]
-        if (lastRsi && !isNaN(lastRsi.value)) setRsiValue(lastRsi.value)
-      }
-      if (rsiChart) {
-        requestAnimationFrame(() => {
-          try {
-            const range = chart.timeScale().getVisibleLogicalRange()
-            if (range) rsiChart.timeScale().setVisibleLogicalRange(range)
-          } catch(_) {}
-        })
+        if (lastRsi) setRsiValue(lastRsi.value)
       }
     }
 
@@ -275,7 +248,6 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
     return () => {
       if (onChartDestroy && chartKey) onChartDestroy(chartKey)
       chart.remove()
-      if (rsiChart) rsiChart.remove()
     }
   }, [code, prevPrice, JSON.stringify(buyLevels), tf, JSON.stringify(indicators), candleData])
 
@@ -315,17 +287,10 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
     if (rsiSeriesRef.current && rsiCfg?.enabled && candlesRef.current.length > rsiCfg.period) {
       const rsiData = calcRSI(candlesRef.current, rsiCfg.period)
       const lastRsi = rsiData[rsiData.length - 1]
-      if (lastRsi && !isNaN(lastRsi.value)) {
+      if (lastRsi) {
         rsiSeriesRef.current.update(lastRsi)
         setRsiValue(lastRsi.value)
       }
-      // rAF: LWC auto-scroll rAF 이후 논리 범위 동기화 (항상 실행)
-      requestAnimationFrame(() => {
-        try {
-          const range = chartRef.current?.timeScale()?.getVisibleLogicalRange()
-          if (range && rsiChartRef.current) rsiChartRef.current.timeScale().setVisibleLogicalRange(range)
-        } catch(_) {}
-      })
     }
 
     // SuperTrend 마지막 값 증분 업데이트
@@ -384,13 +349,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
           }}>매도</button>
         </div>
       </div>
-      <div ref={containerRef} style={{ flex: indicators.rsi.enabled ? 3 : 1, minHeight: 0 }} />
-      {indicators.rsi.enabled && (
-        <div style={{ borderTop: '1px solid #222', position: 'relative', flexShrink: 0, height: '15%', minHeight: 36 }}>
-          <span style={{ position: 'absolute', top: 1, left: 4, fontSize: 8, color: '#e0aa00', zIndex: 2, pointerEvents: 'none' }}>RSI({indicators.rsi.period})</span>
-          <div ref={rsiContainerRef} style={{ width: '100%', height: '100%' }} />
-        </div>
-      )}
+      <div ref={containerRef} style={{ flex: 1, minHeight: 0 }} />
     </div>
   )
 }
