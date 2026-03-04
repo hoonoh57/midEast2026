@@ -114,6 +114,20 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, onBuy, onSell }
     candleSeriesRef.current = candleSeries
     volumeSeriesRef.current = volumeSeries
 
+    // 과거 캔들 시드 로드 (snapshot의 candle_history)
+    if (window.__CANDLE_HISTORY && window.__CANDLE_HISTORY[code]) {
+      const hist = window.__CANDLE_HISTORY[code]
+      candleSeries.setData(hist)
+      volumeSeries.setData(hist.map(c => ({
+        time: c.time,
+        value: c.volume || 0,
+        color: c.close >= c.open ? '#ef535066' : '#2962ff66',
+      })))
+      if (hist.length > 0) {
+        lastBarRef.current = { ...hist[hist.length - 1] }
+      }
+    }
+
     const handleResize = () => {
       if (containerRef.current) {
         chart.applyOptions({
@@ -357,6 +371,9 @@ export default function TradingDashboard() {
       ws.current.onmessage = (e) => {
         const msg = JSON.parse(e.data)
         if (msg.type === 'snapshot') {
+          if (msg.data.candle_history) {
+            window.__CANDLE_HISTORY = msg.data.candle_history
+          }
           setState(msg.data)
         }
         if (msg.type === 'update') {

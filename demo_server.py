@@ -75,9 +75,46 @@ def generate_whipsaw_status() -> dict:
 
 def demo_loop():
     """1초마다 더미 시세 + 상태 업데이트"""
+    import math
+
     # 초기 가격 설정
     for code, info in DEMO_STOCKS.items():
         engine_state["prices"][code] = info['prev']
+
+    # ── 과거 1분봉 시드 데이터 생성 (최근 60분) ──
+    engine_state["candle_history"] = {}
+    now_ts = int(time.time())
+    for code, info in DEMO_STOCKS.items():
+        candles = []
+        price = info['prev']
+        for i in range(60, 0, -1):
+            bar_time = now_ts - (i * 60)
+            bar_time = bar_time - (bar_time % 60)
+            change = random.uniform(-0.008, 0.008)
+            o = price
+            c = int(price * (1 + change))
+            h = max(o, c) + random.randint(0, int(price * 0.003))
+            l = min(o, c) - random.randint(0, int(price * 0.003))
+            vol = random.randint(50, 500)
+            candles.append({"time": bar_time, "open": o, "high": h, "low": l, "close": c, "volume": vol})
+            price = c
+        engine_state["candle_history"][code] = candles
+        engine_state["prices"][code] = price
+
+    # KOSPI 시드
+    kospi_candles = []
+    kp = 5432
+    for i in range(60, 0, -1):
+        bar_time = now_ts - (i * 60)
+        bar_time = bar_time - (bar_time % 60)
+        change = random.uniform(-0.002, 0.002)
+        o = kp
+        c = int(kp * (1 + change))
+        h = max(o, c) + random.randint(0, 10)
+        l = min(o, c) - random.randint(0, 10)
+        kospi_candles.append({"time": bar_time, "open": o, "high": h, "low": l, "close": c, "volume": random.randint(1000, 5000)})
+        kp = c
+    engine_state["candle_history"]["KOSPI"] = kospi_candles
 
     cycle = 0
     while True:
@@ -87,7 +124,6 @@ def demo_loop():
         # ── 가격 업데이트 ──
         for code, info in DEMO_STOCKS.items():
             current = engine_state["prices"].get(code, info['prev'])
-            # 소폭 변동 (±0.5%)
             jitter = random.uniform(-0.005, 0.005)
             unit = 100 if current > 100000 else 50 if current > 10000 else 5
             new_price = max(unit, int(current * (1 + jitter)))
@@ -140,18 +176,12 @@ def demo_loop():
         # ── 더미 보유종목 ──
         if cycle == 1:
             engine_state["holdings"] = [
-                {
-                    "code": "005930", "name": "삼성전자", "qty": 10,
-                    "avg_price": 190000,
-                    "current": engine_state["prices"].get("005930", 190000),
-                    "pnl": 0, "pnl_pct": 0,
-                },
-                {
-                    "code": "012450", "name": "한화에어로", "qty": 2,
-                    "avg_price": 1380000,
-                    "current": engine_state["prices"].get("012450", 1380000),
-                    "pnl": 0, "pnl_pct": 0,
-                },
+                {"code": "005930", "name": "삼성전자", "qty": 10,
+                 "avg_price": 190000, "current": engine_state["prices"].get("005930", 190000),
+                 "pnl": 0, "pnl_pct": 0},
+                {"code": "012450", "name": "한화에어로", "qty": 2,
+                 "avg_price": 1380000, "current": engine_state["prices"].get("012450", 1380000),
+                 "pnl": 0, "pnl_pct": 0},
             ]
         else:
             for h in engine_state["holdings"]:
