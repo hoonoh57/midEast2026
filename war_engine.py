@@ -157,9 +157,9 @@ WHIPSAW_CONFIG_20260304 = {
                'emergency_sell': 1_290_000, 'afternoon_buy': 1_380_000},
     '079550': {'expected_high': 845_000, 'safe_zone': (700_000, 750_000),
                'emergency_sell': 650_000, 'afternoon_buy': 720_000},
-    '064350': {'expected_high': 0, 'safe_zone': (220_000, 240_000),
+    '064350': {'expected_high': 290_000, 'safe_zone': (220_000, 240_000),
                'emergency_sell': 210_000, 'afternoon_buy': 230_000},
-    '272210': {'expected_high': 0, 'safe_zone': (130_000, 142_000),
+    '272210': {'expected_high': 190_000, 'safe_zone': (130_000, 142_000),
                'emergency_sell': 120_000, 'afternoon_buy': 135_000},
 }
 
@@ -363,8 +363,9 @@ class ExternalDataCollector:
     """외부 데이터 주기적 수집 (5분 간격)"""
 
     WAR_KEYWORDS_NEGATIVE = ['확전', '지상군', '핵', '호르무즈봉쇄', '추가공습',
-                              '미사일', '사상자', 'NATO']
-    WAR_KEYWORDS_POSITIVE = ['휴전', '협상', '철수', '종전', '봉쇄해제', '평화']
+                              '미사일', '사상자', 'NATO', '모즈타바', '보복선언', '미군사상']
+    WAR_KEYWORDS_POSITIVE = ['휴전', '협상', '철수', '종전', '봉쇄해제', '평화',
+                              '모즈타바_협상', '협상의지']
 
     def __init__(self):
         self.latest_wti = 80.0
