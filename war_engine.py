@@ -151,6 +151,18 @@ SECTOR_ALLOCATION = {
     'cash': 0.15,
 }
 
+# 3/4 전용 요동장 파라미터 (전일 상한가 방산주 갭업→급락 대응)
+WHIPSAW_CONFIG_20260304 = {
+    '012450': {'expected_high': 1_655_000, 'safe_zone': (1_350_000, 1_420_000),
+               'emergency_sell': 1_290_000, 'afternoon_buy': 1_380_000},
+    '079550': {'expected_high': 845_000, 'safe_zone': (700_000, 750_000),
+               'emergency_sell': 650_000, 'afternoon_buy': 720_000},
+    '064350': {'expected_high': 0, 'safe_zone': (220_000, 240_000),
+               'emergency_sell': 210_000, 'afternoon_buy': 230_000},
+    '272210': {'expected_high': 0, 'safe_zone': (130_000, 142_000),
+               'emergency_sell': 120_000, 'afternoon_buy': 135_000},
+}
+
 # ═══════════════════════════════════════════════════════════════
 # SERVER32 API CLIENT
 # ═══════════════════════════════════════════════════════════════
@@ -530,6 +542,191 @@ class TechnicalAnalysis:
 
 
 # ═══════════════════════════════════════════════════════════════
+# WHIPSAW DEFENSE ENGINE — 요동장 감지 & 대응
+# ═══════════════════════════════════════════════════════════════
+
+class WhipsawPhase(Enum):
+    PRE_MARKET_SURGE    = "pre_market_surge"      # 프리마켓 갭업  08:30~09:00
+    OPENING_SPIKE       = "opening_spike"         # 장초 스파이크  09:00~09:15
+    PROFIT_TAKING_DUMP  = "profit_taking_dump"    # 차익실현 폭락  09:15~10:00
+    DEAD_CAT_BOUNCE     = "dead_cat_bounce"       # 기술적 반등   10:00~10:30
+    STABILIZATION       = "stabilization"         # 안정화       10:30~11:30
+    AFTERNOON_TREND     = "afternoon_trend"       # 오후 추세 확정 11:30~15:30
+
+
+@dataclass
+class WhipsawTracker:
+    code: str
+    name: str
+    prev_close: int
+    session_high: int = 0
+    session_low: int = 999_999_999
+    high_timestamp: Optional[datetime] = None
+    current_price: int = 0
+    hit_near_limit_up: bool = False
+    crash_from_high: bool = False
+    bounce_detected: bool = False
+    buy_locked_until: Optional[datetime] = None
+    sell_triggered: bool = False
+
+    @property
+    def gap_up_pct(self) -> float:
+        if self.prev_close <= 0: return 0.0
+        return (self.current_price - self.prev_close) / self.prev_close
+
+    @property
+    def high_from_prev_close_pct(self) -> float:
+        if self.prev_close <= 0: return 0.0
+        return (self.session_high - self.prev_close) / self.prev_close
+
+    @property
+    def drawdown_from_high_pct(self) -> float:
+        if self.session_high <= 0: return 0.0
+        return (self.current_price - self.session_high) / self.session_high
+
+
+class WhipsawDefenseEngine:
+    """요동장(갭업→급락) 감지 & 매수 잠금/긴급매도 제어"""
+
+    NEAR_LIMIT_UP_PCT      = 0.25    # 전일비 +25% → 상한가 근접
+    SPIKE_DANGER_PCT       = 0.20    # +20% 갭업 → 장초 추격 금지
+    CRASH_THRESHOLD_PCT    = -0.12   # 고점비 -12% → 급락 구간
+    BOUNCE_MIN_PCT         = 0.03    # 저점비 +3% → 반등 감지
+    SAFE_ENTRY_DRAWDOWN    = -0.08   # 고점비 -8%~-12% → 안전 진입대
+    EMERGENCY_SELL_DRAWDOWN = -0.20  # 고점비 -20% → 긴급 매도
+
+    TIME_ALLOCATION: Dict[WhipsawPhase, float] = {
+        WhipsawPhase.PRE_MARKET_SURGE:   0.00,
+        WhipsawPhase.OPENING_SPIKE:      0.00,
+        WhipsawPhase.PROFIT_TAKING_DUMP: 0.00,
+        WhipsawPhase.DEAD_CAT_BOUNCE:    0.15,
+        WhipsawPhase.STABILIZATION:      0.35,
+        WhipsawPhase.AFTERNOON_TREND:    0.50,
+    }
+
+    def __init__(self):
+        self.trackers: Dict[str, WhipsawTracker] = {}
+
+    def register(self, code: str, name: str, prev_close: int):
+        self.trackers[code] = WhipsawTracker(code=code, name=name, prev_close=prev_close)
+
+    def update_price(self, code: str, price: int, ts: datetime):
+        if code not in self.trackers or price <= 0:
+            return
+        t = self.trackers[code]
+        t.current_price = price
+        if price > t.session_high:
+            t.session_high = price
+            t.high_timestamp = ts
+        if price < t.session_low:
+            t.session_low = price
+
+        if t.high_from_prev_close_pct >= self.NEAR_LIMIT_UP_PCT and not t.hit_near_limit_up:
+            t.hit_near_limit_up = True
+            log.warning(f"⚠️ [{t.name}] 상한가 근접! 고가={t.session_high:,} "
+                        f"(+{t.high_from_prev_close_pct:.1%})")
+
+        if t.hit_near_limit_up and t.drawdown_from_high_pct <= self.CRASH_THRESHOLD_PCT \
+                and not t.crash_from_high:
+            t.crash_from_high = True
+            t.buy_locked_until = ts + timedelta(minutes=30)
+            log.warning(f"🔻 [{t.name}] 급락! {t.session_high:,}→{price:,} "
+                        f"({t.drawdown_from_high_pct:.1%}), 잠금 ~{t.buy_locked_until.strftime('%H:%M')}")
+
+        if t.drawdown_from_high_pct <= self.EMERGENCY_SELL_DRAWDOWN and not t.sell_triggered:
+            t.sell_triggered = True
+            log.critical(f"🚨 [{t.name}] 긴급매도 트리거! 고점비 {t.drawdown_from_high_pct:.1%}")
+
+        if t.crash_from_high and not t.bounce_detected and t.session_low > 0:
+            bounce = (price - t.session_low) / t.session_low
+            if bounce >= self.BOUNCE_MIN_PCT:
+                t.bounce_detected = True
+                log.info(f"📈 [{t.name}] 반등 감지 (+{bounce:.1%})")
+
+    def get_phase(self, now: datetime) -> WhipsawPhase:
+        h, m = now.hour, now.minute
+        if (h, m) < (9, 0):   return WhipsawPhase.PRE_MARKET_SURGE
+        if (h, m) < (9, 15):  return WhipsawPhase.OPENING_SPIKE
+        if (h, m) < (10, 0):  return WhipsawPhase.PROFIT_TAKING_DUMP
+        if (h, m) < (10, 30): return WhipsawPhase.DEAD_CAT_BOUNCE
+        if (h, m) < (11, 30): return WhipsawPhase.STABILIZATION
+        return WhipsawPhase.AFTERNOON_TREND
+
+    def can_buy(self, code: str, now: datetime) -> Tuple[bool, str]:
+        if code not in self.trackers:
+            return True, "미등록"
+        t = self.trackers[code]
+        phase = self.get_phase(now)
+
+        if t.hit_near_limit_up and not t.crash_from_high:
+            return False, f"상한가 근접 대기 (고가 {t.session_high:,})"
+        if t.buy_locked_until and now < t.buy_locked_until:
+            rem = (t.buy_locked_until - now).seconds // 60
+            return False, f"급락 후 잠금 중 ({rem}분 남음)"
+        if t.gap_up_pct >= self.SPIKE_DANGER_PCT and \
+                phase in (WhipsawPhase.OPENING_SPIKE, WhipsawPhase.PROFIT_TAKING_DUMP):
+            return False, f"갭업+{t.gap_up_pct:.0%} 장초 추격 금지"
+        if t.sell_triggered and phase != WhipsawPhase.AFTERNOON_TREND:
+            return False, "긴급매도 발동, 오후까지 대기"
+        if self.TIME_ALLOCATION.get(phase, 0) <= 0:
+            return False, f"구간({phase.value}) 매수 불허"
+        if t.crash_from_high and not t.bounce_detected and \
+                phase == WhipsawPhase.DEAD_CAT_BOUNCE:
+            return False, "반등 미확인 관망"
+        return True, f"허용 (구간={phase.value})"
+
+    def size_multiplier(self, code: str, now: datetime) -> float:
+        if code not in self.trackers: return 1.0
+        t = self.trackers[code]
+        phase = self.get_phase(now)
+        if t.crash_from_high and t.bounce_detected and phase == WhipsawPhase.DEAD_CAT_BOUNCE:
+            return 0.3
+        if phase == WhipsawPhase.STABILIZATION:
+            return 0.5 if abs(t.drawdown_from_high_pct) > 0.15 else 0.7
+        if phase == WhipsawPhase.AFTERNOON_TREND:
+            return 1.0 if t.current_price > t.session_low * 1.05 else 0.6
+        return self.TIME_ALLOCATION.get(phase, 0.0)
+
+    def optimal_entry(self, code: str) -> Optional[int]:
+        if code not in self.trackers: return None
+        t = self.trackers[code]
+        if not t.hit_near_limit_up: return None
+        lo = int(t.session_high * (1 + self.CRASH_THRESHOLD_PCT))
+        hi = int(t.session_high * (1 + self.SAFE_ENTRY_DRAWDOWN))
+        return (lo + hi) // 2
+
+    def emergency_sell(self, code: str) -> Tuple[bool, str]:
+        if code not in self.trackers: return False, ""
+        t = self.trackers[code]
+        if t.sell_triggered:
+            return True, f"긴급매도: {t.name} 고점비 {t.drawdown_from_high_pct:.1%}"
+        return False, ""
+
+    def reset_daily(self):
+        for t in self.trackers.values():
+            t.session_high = 0
+            t.session_low = 999_999_999
+            t.high_timestamp = None
+            t.current_price = 0
+            t.hit_near_limit_up = False
+            t.crash_from_high = False
+            t.bounce_detected = False
+            t.buy_locked_until = None
+            t.sell_triggered = False
+        log.info("🔄 요동장 엔진 일일 리셋")
+
+    def status_report(self) -> str:
+        lines = ["─── 요동장 상태 ───"]
+        for code, t in self.trackers.items():
+            flag = ("🚨긴급" if t.sell_triggered else
+                    "🔻급락" if t.crash_from_high else
+                    "⚠️근접" if t.hit_near_limit_up else "✅")
+            lines.append(f"  {flag} {t.name} 고점{t.session_high:,} "
+                         f"현재{t.current_price:,} ({t.drawdown_from_high_pct:+.1%})")
+        return "\n".join(lines)
+
+
+# ═══════════════════════════════════════════════════════════════
 # CHART ENGINES
 # ═══════════════════════════════════════════════════════════════
 
@@ -613,56 +810,98 @@ class Chart1_MacroRegime:
 
 
 class Chart2_DefenseScalp:
-    """CHART 2: 방산주 스캘핑/스윙"""
+    """CHART 2: 방산주 스캘핑/스윙 — 요동장(Whipsaw) 대응 통합 버전"""
 
-    def __init__(self, ta: TechnicalAnalysis):
+    def __init__(self, ta: TechnicalAnalysis, whipsaw: WhipsawDefenseEngine):
         self.ta = ta
+        self.whipsaw = whipsaw
 
     def generate_signal(self, code: str, minute_df: pd.DataFrame,
                         daily_df: pd.DataFrame, beta: float,
-                        current_price: int) -> Optional[Signal]:
-        if minute_df.empty or len(minute_df) < 20:
-            return None
-
+                        current_price: int, now: datetime = None,
+                        holding_qty: int = 0) -> Optional[Signal]:
         target = TARGETS.get(code)
         if not target or target.sector != 'defense':
             return None
-
         if current_price <= 0:
             return None
 
-        rsi_val = self.ta.rsi(minute_df['close'], 9).iloc[-1]
+        if now is None:
+            now = datetime.now()
+
+        # ── STEP 0: 요동장 가격 업데이트 ──
+        self.whipsaw.update_price(code, current_price, now)
+
+        # ── STEP 1: 긴급 매도 (최우선) ──
+        if holding_qty > 0:
+            should_sell, reason = self.whipsaw.emergency_sell(code)
+            if should_sell:
+                return Signal(
+                    code=code, name=target.name, action='SELL',
+                    price=current_price, quantity=holding_qty,
+                    confidence=99, chart='DEFENSE',
+                    reason=f'[요동장 긴급매도] {reason}',
+                )
+
+        # ── STEP 2: 분봉 데이터 부족 → HOLD ──
+        if minute_df.empty or len(minute_df) < 20:
+            return None
+
+        rsi_val   = self.ta.rsi(minute_df['close'], 9).iloc[-1]
         bb_u, bb_m, bb_l = self.ta.bollinger(minute_df['close'], 20, 2.0)
-        vwap_val = self.ta.vwap(minute_df).iloc[-1]
-        vol_mean = minute_df['volume'].rolling(20).mean().iloc[-1]
+        vwap_val  = self.ta.vwap(minute_df).iloc[-1]
+        vol_mean  = minute_df['volume'].rolling(20).mean().iloc[-1]
         vol_ratio = (minute_df['volume'].iloc[-1] / vol_mean) if vol_mean > 0 else 1
 
-        buy_score = sum([
-            current_price >= vwap_val * 0.995,
-            current_price <= vwap_val * 1.02,
-            rsi_val < 40,
-            current_price > bb_l.iloc[-1],
-            vol_ratio > 1.5,
-        ])
+        # ── STEP 3: 요동장 매수 허용 체크 ──
+        can_buy_flag, deny_reason = self.whipsaw.can_buy(code, now)
+        phase = self.whipsaw.get_phase(now)
 
-        if buy_score >= 4:
-            qty = max(1, int(100_000_000 * target.sector_weight *
-                             SECTOR_ALLOCATION['defense'] * beta / current_price))
-            return Signal(
-                code=code, name=target.name, action='BUY',
-                price=current_price, quantity=qty,
-                confidence=min(buy_score / 5 * 100, 95),
-                chart='DEFENSE', reason=f'VWAP지지+RSI({rsi_val:.0f})+거래량({vol_ratio:.1f}x)',
-                stop_loss=int(current_price * (1 + target.stop_loss_pct)),
-                take_profit=int(current_price * 1.05),
-            )
+        if can_buy_flag:
+            # 요동장 최적 진입가 vs VWAP 기반 선택
+            opt_entry = self.whipsaw.optimal_entry(code)
+            if opt_entry is not None:
+                price_ok = current_price <= opt_entry
+                price_reason = f'요동장진입가({current_price:,}≤{opt_entry:,})'
+            else:
+                price_ok = vwap_val * 0.995 <= current_price <= vwap_val * 1.02
+                price_reason = f'VWAP({vwap_val:,.0f})±2%'
 
-        if rsi_val > 78 or current_price > bb_u.iloc[-1] * 0.98:
+            buy_score = sum([
+                price_ok,
+                rsi_val < 45,
+                current_price > bb_l.iloc[-1],
+                vol_ratio > 1.2,
+            ])
+
+            if buy_score >= 3:
+                base_qty = max(1, int(100_000_000 * target.sector_weight *
+                                      SECTOR_ALLOCATION['defense'] * beta / current_price))
+                mult = self.whipsaw.size_multiplier(code, now)
+                qty  = max(1, int(base_qty * mult))
+                return Signal(
+                    code=code, name=target.name, action='BUY',
+                    price=current_price, quantity=qty,
+                    confidence=min(buy_score / 4 * 100 * mult, 95),
+                    chart='DEFENSE',
+                    reason=(f'[{phase.value}] {price_reason} '
+                            f'RSI={rsi_val:.0f} 배수={mult:.0%}'),
+                    stop_loss=int(current_price * (1 + target.stop_loss_pct)),
+                    take_profit=int(current_price * 1.05),
+                )
+
+        # ── STEP 4: 일반 매도 (보유 중 + 과매수) ──
+        if rsi_val > 75 or current_price > bb_u.iloc[-1] * 0.98:
+            tracker = self.whipsaw.trackers.get(code)
+            # 요동장 종목은 절반만 매도, 나머지 추세 추종
+            qty = (holding_qty // 2 if tracker and tracker.hit_near_limit_up
+                   else 0)   # 0 = 전량 (OrderExecutor가 실제 보유수량 사용)
             return Signal(
                 code=code, name=target.name, action='SELL',
-                price=current_price, quantity=0,
+                price=current_price, quantity=qty,
                 confidence=80, chart='DEFENSE',
-                reason=f'RSI과매수({rsi_val:.0f}) 또는 BB상단 근접',
+                reason=(f'RSI과매수({rsi_val:.0f}) BB상단근접'
+                        + (' [요동장 절반매도]' if qty > 0 else '')),
             )
 
         return None
@@ -1080,8 +1319,9 @@ class WarAdaptiveEngine:
         self.risk = RiskManager(self.TOTAL_CAPITAL)
         self.executor = OrderExecutor(self.api, self.risk)
 
+        self.whipsaw = WhipsawDefenseEngine()
         self.chart1 = Chart1_MacroRegime()
-        self.chart2 = Chart2_DefenseScalp(self.ta)
+        self.chart2 = Chart2_DefenseScalp(self.ta, self.whipsaw)
         self.chart3 = Chart3_EnergyOil(self.ta)
         self.chart4 = Chart4_SemiContrarian(self.ta)
 
@@ -1128,11 +1368,18 @@ class WarAdaptiveEngine:
         self.api.subscribe_realtime(all_codes, screen='1000')
         log.info(f"📡 실시간 구독: {len(all_codes)}종목")
 
+        # 요동장 엔진에 방산·에너지 종목 등록
+        for code, target in TARGETS.items():
+            if target.sector in ('defense', 'energy') and target.prev_close > 0:
+                self.whipsaw.register(code, target.name, target.prev_close)
+                log.info(f"  요동장 등록: {target.name} ({code})")
+
         log.info("✅ 초기화 완료 — 엔진 가동 준비")
         return True
 
     def _on_tick(self, code: str, price: int, volume: int, raw: dict):
-        pass
+        # 요동장 엔진 실시간 가격 업데이트 (틱마다)
+        self.whipsaw.update_price(code, price, datetime.now())
 
     def _on_execution(self, data: dict):
         msg_type = data.get('type', '')
@@ -1163,14 +1410,15 @@ class WarAdaptiveEngine:
                 )
 
                 holdings = self.api.get_balance()
+                now = datetime.now()
 
                 # 미실현 손익 갱신 (매 사이클)
                 self.risk.update_unrealized_pnl(holdings, self.rt.prices)
 
-                # 일일 손익 초기화 (09:00 장 시작 1회)
-                now = datetime.now()
-                if now.hour == 9 and now.minute == 0 and now.second < self.CYCLE_INTERVAL:
+                # 일일 초기화 (08:50 — 장 시작 10분 전)
+                if now.hour == 8 and now.minute == 50 and now.second < self.CYCLE_INTERVAL:
                     self.risk.reset_daily()
+                    self.whipsaw.reset_daily()
 
                 all_signals: List[Signal] = []
 
@@ -1188,8 +1436,11 @@ class WarAdaptiveEngine:
                     daily_df = self.db.get_daily_candles_df(code, days=60)
 
                     if target.sector == 'defense':
+                        held = next((int(h.get('보유수량', '0')) for h in holdings
+                                     if h.get('종목코드', '').strip() == code), 0)
                         sig = self.chart2.generate_signal(
-                            code, min_df, daily_df, beta, price
+                            code, min_df, daily_df, beta, price,
+                            now=now, holding_qty=held,
                         )
                         if sig:
                             all_signals.append(sig)
@@ -1224,7 +1475,8 @@ class WarAdaptiveEngine:
                         f"  뉴스: {self.ext.news_sentiment}\n"
                         f"  전쟁: D+{self.chart1.war_day_count}\n"
                         f"  시그널: {len(all_signals)}건\n"
-                        f"  종목가: {dict(list(self.rt.prices.items())[:5])}"
+                        f"  종목가: {dict(list(self.rt.prices.items())[:5])}\n"
+                        f"  {self.whipsaw.status_report()}"
                     )
 
                 sleep_time = max(0, self.CYCLE_INTERVAL - elapsed)
