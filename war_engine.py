@@ -120,27 +120,27 @@ TARGETS: Dict[str, TargetStock] = {
     '096770': TargetStock('096770', 'SK이노베이션', 'energy',
                           130000, 160000, -0.07, 0.30),
     '011200': TargetStock('011200', 'HMM', 'energy',
-                          0, 0, -0.08, 0.20),
+                          25750, 32000, -0.08, 0.20),   # 0,0→25750,32000 (3/3 종가+목표가)
     '028670': TargetStock('028670', '팬오션', 'energy',
-                          0, 0, -0.08, 0.15),
+                          4800, 6000, -0.08, 0.15),      # 0,0→4800,6000
     # ── 반도체 (30%) — 역발상 분할매수 ──
     '005930': TargetStock('005930', '삼성전자', 'semiconductor',
                           195100, 260000, -0.10, 0.55,
                           buy_levels=[
                               {'price': 195000, 'pct': 0.15, 'label': 'L1'},
-                              {'price': 188000, 'pct': 0.20, 'label': 'L2'},
-                              {'price': 180000, 'pct': 0.25, 'label': 'L3'},
-                              {'price': 172000, 'pct': 0.25, 'label': 'L4'},
-                              {'price': 165000, 'pct': 0.15, 'label': 'L5'},
+                              {'price': 183000, 'pct': 0.20, 'label': 'L2'},   # 188000→183000 (3/4 장중 183,300 도달)
+                              {'price': 175000, 'pct': 0.25, 'label': 'L3'},   # 180000→175000
+                              {'price': 165000, 'pct': 0.25, 'label': 'L4'},
+                              {'price': 155000, 'pct': 0.15, 'label': 'L5'},   # 165000→155000
                           ]),
     '000660': TargetStock('000660', 'SK하이닉스', 'semiconductor',
                           939000, 1350000, -0.10, 0.45,
                           buy_levels=[
                               {'price': 940000, 'pct': 0.15, 'label': 'L1'},
-                              {'price': 900000, 'pct': 0.20, 'label': 'L2'},
-                              {'price': 850000, 'pct': 0.25, 'label': 'L3'},
-                              {'price': 800000, 'pct': 0.25, 'label': 'L4'},
-                              {'price': 750000, 'pct': 0.15, 'label': 'L5'},
+                              {'price': 891000, 'pct': 0.20, 'label': 'L2'},   # 900000→891000 (3/4 장중 891,000 도달)
+                              {'price': 840000, 'pct': 0.25, 'label': 'L3'},   # 850000→840000
+                              {'price': 790000, 'pct': 0.25, 'label': 'L4'},   # 800000→790000
+                              {'price': 740000, 'pct': 0.15, 'label': 'L5'},   # 750000→740000
                           ]),
 }
 
@@ -628,6 +628,9 @@ class Chart2_DefenseScalp:
         if not target or target.sector != 'defense':
             return None
 
+        if current_price <= 0:
+            return None
+
         rsi_val = self.ta.rsi(minute_df['close'], 9).iloc[-1]
         bb_u, bb_m, bb_l = self.ta.bollinger(minute_df['close'], 20, 2.0)
         vwap_val = self.ta.vwap(minute_df).iloc[-1]
@@ -680,6 +683,10 @@ class Chart3_EnergyOil:
         if minute_df.empty or len(minute_df) < 10:
             return None
 
+        if target.prev_close <= 0 or current_price <= 0:
+            log.warning(f"⚠️ {code} prev_close={target.prev_close}, current={current_price} → 스킵")
+            return None
+
         rsi_val = self.ta.rsi(minute_df['close'], 9).iloc[-1]
 
         if news_sent in ('POS', 'EXTREME_POS'):
@@ -727,6 +734,9 @@ class Chart4_SemiContrarian:
         if not target or target.sector != 'semiconductor':
             return []
         if not target.buy_levels:
+            return []
+
+        if current_price <= 0:
             return []
 
         signals = []
@@ -868,25 +878,64 @@ class RealtimeHandler:
 class RiskManager:
 
     MAX_SINGLE_POSITION = 0.15
-    MAX_DAILY_LOSS = -0.05
-    MAX_DRAWDOWN = -0.12
+    MAX_DAILY_LOSS = -0.06       # -0.05→-0.06 (전쟁 변동성 반영)
+    MAX_DRAWDOWN = -0.15         # -0.12→-0.15
     MIN_CASH = 0.10
 
     def __init__(self, total_capital: int):
         self.total_capital = total_capital
         self.daily_pnl = 0
         self.max_equity = total_capital
+        self.realized_pnl = 0    # 실현 손익 (매도 체결 누적)
+        self.unrealized_pnl = 0  # 미실현 손익 (보유 평가)
+
+    def on_sell_executed(self, sell_price: int, avg_buy_price: int, quantity: int):
+        """매도 체결 시 실현 손익 반영"""
+        pnl = (sell_price - avg_buy_price) * quantity
+        self.realized_pnl += pnl
+        self.daily_pnl = self.realized_pnl + self.unrealized_pnl
+        log.info(f"💰 실현손익 갱신: 이번 {pnl:+,}원, "
+                 f"누적실현 {self.realized_pnl:+,}원, "
+                 f"일일합산 {self.daily_pnl:+,}원")
+
+    def update_unrealized_pnl(self, holdings: list, current_prices: dict):
+        """보유종목 미실현 손익 실시간 반영 + max_equity 갱신"""
+        unrealized = 0
+        for h in holdings:
+            code = h.get('종목코드', '').strip()
+            qty = int(h.get('보유수량', '0'))
+            avg_price = int(h.get('매입단가', '0'))
+            cur_price = current_prices.get(code, avg_price)
+            unrealized += (cur_price - avg_price) * qty
+        self.unrealized_pnl = unrealized
+        self.daily_pnl = self.realized_pnl + self.unrealized_pnl
+
+        current_equity = self.total_capital + self.daily_pnl
+        if current_equity > self.max_equity:
+            self.max_equity = current_equity
+
+    def reset_daily(self):
+        """매일 장 시작 시 일일 손익 초기화"""
+        log.info(f"🔄 전일 최종 손익: {self.daily_pnl:+,}원 → 초기화")
+        self.daily_pnl = 0
+        self.realized_pnl = 0
+        self.unrealized_pnl = 0
 
     def can_buy(self, signal: Signal, current_holdings: list) -> bool:
-        if self.daily_pnl / self.total_capital < self.MAX_DAILY_LOSS:
-            log.warning(f"⛔ 일일 손실 한도 초과 → 매수 차단")
+        if self.total_capital > 0 and \
+           self.daily_pnl / self.total_capital < self.MAX_DAILY_LOSS:
+            log.warning(f"⛔ 일일 손실 한도 초과 "
+                        f"({self.daily_pnl/self.total_capital*100:.1f}% < "
+                        f"{self.MAX_DAILY_LOSS*100:.0f}%) → 매수 차단")
             return False
 
         equity = self.total_capital + self.daily_pnl
-        dd = (equity - self.max_equity) / self.max_equity
-        if dd < self.MAX_DRAWDOWN:
-            log.warning(f"⛔ 총 낙폭 한도({dd*100:.1f}%) 초과 → 전면 매매 중단")
-            return False
+        if self.max_equity > 0:
+            dd = (equity - self.max_equity) / self.max_equity
+            if dd < self.MAX_DRAWDOWN:
+                log.warning(f"⛔ 총 낙폭 한도({dd*100:.1f}% < "
+                            f"{self.MAX_DRAWDOWN*100:.0f}%) → 전면 매매 중단")
+                return False
 
         return True
 
@@ -940,9 +989,11 @@ class OrderExecutor:
 
         elif signal.action == 'SELL':
             held_qty = 0
+            avg_buy_price = 0
             for h in holdings:
                 if h.get('종목코드', '').strip() == signal.code:
                     held_qty = int(h.get('보유수량', '0'))
+                    avg_buy_price = int(h.get('매입단가', '0'))
                     break
 
             sell_qty = held_qty if signal.quantity == 0 else min(signal.quantity, held_qty)
@@ -960,6 +1011,14 @@ class OrderExecutor:
                 price=0,
                 quote_type='03',
             )
+
+            if result.get('Success') and avg_buy_price > 0:
+                self.risk.on_sell_executed(
+                    sell_price=signal.price,
+                    avg_buy_price=avg_buy_price,
+                    quantity=sell_qty,
+                )
+
             self.executed_orders.append({
                 'signal': signal, 'result': result, 'time': signal.timestamp
             })
@@ -1104,6 +1163,15 @@ class WarAdaptiveEngine:
                 )
 
                 holdings = self.api.get_balance()
+
+                # 미실현 손익 갱신 (매 사이클)
+                self.risk.update_unrealized_pnl(holdings, self.rt.prices)
+
+                # 일일 손익 초기화 (09:00 장 시작 1회)
+                now = datetime.now()
+                if now.hour == 9 and now.minute == 0 and now.second < self.CYCLE_INTERVAL:
+                    self.risk.reset_daily()
+
                 all_signals: List[Signal] = []
 
                 for code, target in TARGETS.items():
