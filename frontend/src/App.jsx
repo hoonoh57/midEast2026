@@ -205,7 +205,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         autoSize: true,
         layout: { background: { type: ColorType.Solid, color: '#080810' }, textColor: '#666', fontSize: 9 },
         grid: { vertLines: { color: '#141428' }, horzLines: { color: '#141428' } },
-        timeScale: { visible: false, rightOffset: 5 },
+        timeScale: { visible: false },
         rightPriceScale: { borderColor: '#222', scaleMargins: { top: 0.05, bottom: 0.05 } },
         crosshair: { vertLine: { visible: false }, horzLine: { color: '#444', style: 2 } },
         handleScroll: false, handleScale: false,
