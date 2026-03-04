@@ -106,7 +106,8 @@ function calcRSI(candles, period = 14) {
   let avgGain = 0, avgLoss = 0
 
   for (let i = 0; i < candles.length; i++) {
-    if (i === 0) { result.push(null); continue }
+    // null 대신 whitespace({time만}) 사용 → 메인 차트와 시간 격자 일치
+    if (i === 0) { result.push({ time: candles[i].time }); continue }
     const change = candles[i].close - candles[i-1].close
     const gain = change > 0 ? change : 0
     const loss = change < 0 ? -change : 0
@@ -117,7 +118,7 @@ function calcRSI(candles, period = 14) {
         avgGain /= period; avgLoss /= period
         const rs = avgLoss === 0 ? 100 : avgGain / avgLoss
         result.push({ time: candles[i].time, value: Math.round(100 - 100 / (1 + rs)) })
-      } else { result.push(null) }
+      } else { result.push({ time: candles[i].time }) }
     } else {
       avgGain = (avgGain * (period - 1) + gain) / period
       avgLoss = (avgLoss * (period - 1) + loss) / period
@@ -125,7 +126,7 @@ function calcRSI(candles, period = 14) {
       result.push({ time: candles[i].time, value: Math.round(100 - 100 / (1 + rs)) })
     }
   }
-  return result.filter(Boolean)
+  return result  // whitespace 포함, filter 없음
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -255,7 +256,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       if (rsiSeries && indicators.rsi.enabled) {
         const rsi = calcRSI(candles, indicators.rsi.period)
         rsiSeries.setData(rsi)
-        if (rsi.length > 0) setRsiValue(rsi[rsi.length - 1].value)
+        const lastRsi = rsi[rsi.length - 1]
+        if (lastRsi?.value !== undefined) setRsiValue(lastRsi.value)
       }
       if (rsiChart) {
         requestAnimationFrame(() => {
@@ -311,10 +313,10 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
     const rsiCfg = indicatorsRef.current?.rsi
     if (rsiSeriesRef.current && rsiCfg?.enabled && candlesRef.current.length > rsiCfg.period) {
       const rsiData = calcRSI(candlesRef.current, rsiCfg.period)
-      if (rsiData.length > 0) {
-        const last = rsiData[rsiData.length - 1]
-        rsiSeriesRef.current.update(last)
-        setRsiValue(last.value)
+      const lastRsi = rsiData[rsiData.length - 1]
+      if (lastRsi?.value !== undefined) {
+        rsiSeriesRef.current.update(lastRsi)
+        setRsiValue(lastRsi.value)
         try {
           const range = chartRef.current?.timeScale()?.getVisibleRange()
           if (range && rsiChartRef.current) rsiChartRef.current.timeScale().setVisibleRange(range)
