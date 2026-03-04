@@ -14,6 +14,7 @@ env/
 *.egg-info/
 dist/
 build/
+!frontend/dist/
 
 # VB.NET / Visual Studio
 bin/

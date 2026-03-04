@@ -136,19 +136,28 @@ export default function TradingDashboard() {
   const ws = useRef(null)
 
   useEffect(() => {
-    const WS_URL = `ws://${window.location.hostname}:5000/ws/dashboard`
-    ws.current = new WebSocket(WS_URL)
+    let reconnectTimer = null
 
-    ws.current.onopen = () => setConnected(true)
-    ws.current.onclose = () => setConnected(false)
-
-    ws.current.onmessage = (e) => {
-      const msg = JSON.parse(e.data)
-      if (msg.type === 'snapshot') setState(msg.data)
-      if (msg.type === 'update') setState(prev => prev ? { ...prev, ...msg } : null)
+    function connect() {
+      const WS_URL = `ws://${window.location.hostname}:5000/ws/dashboard`
+      ws.current = new WebSocket(WS_URL)
+      ws.current.onopen = () => setConnected(true)
+      ws.current.onclose = () => {
+        setConnected(false)
+        reconnectTimer = setTimeout(connect, 2000)
+      }
+      ws.current.onmessage = (e) => {
+        const msg = JSON.parse(e.data)
+        if (msg.type === 'snapshot') setState(msg.data)
+        if (msg.type === 'update') setState(prev => prev ? { ...prev, ...msg } : null)
+      }
     }
 
-    return () => ws.current?.close()
+    connect()
+    return () => {
+      clearTimeout(reconnectTimer)
+      ws.current?.close()
+    }
   }, [])
 
   const send = (payload) => {
@@ -171,6 +180,11 @@ export default function TradingDashboard() {
   }
 
   const TARGETS_ORDER = ['012450', '079550', '272210', '064350', '010950', '096770', '011200', '028670', '005930', '000660']
+  const PREV_CLOSE = {
+    '012450': 1432000, '079550': 661000, '272210': 146700, '064350': 249000,
+    '010950': 141300, '096770': 130000, '011200': 25750, '028670': 4800,
+    '005930': 195100, '000660': 939000,
+  }
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100vh', overflow: 'hidden' }}>
@@ -204,6 +218,7 @@ export default function TradingDashboard() {
             return (
               <StockRow
                 key={code} code={code} price={price} whipsaw={whipsaw}
+                prevPrice={PREV_CLOSE[code]}
                 onBuy={() => handleBuy(code, price)}
                 onSell={() => handleEmergencySell(code)}
               />

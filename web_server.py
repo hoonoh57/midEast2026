@@ -295,6 +295,8 @@ async def startup():
 
 engine_ref = None
 
-def set_engine_ref(engine):
+def set_engine_ref(engine, server32_client=None):
     global engine_ref
     engine_ref = engine
+    if server32_client:
+        engine_ref.api = server32_client
