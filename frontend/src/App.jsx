@@ -63,7 +63,7 @@ function calcATR(candles, period) {
     sum += tr[i]
     if (i >= period - 1) {
       if (i === period - 1) { atr[i] = sum / period }
-      else { atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period; sum = 0 }
+      else { atr[i] = (atr[i-1] * (period - 1) + tr[i]) / period }
     }
   }
   return atr
@@ -132,7 +132,7 @@ function calcRSI(candles, period = 14) {
 // 실시간 캔들 차트 + SuperTrend + RSI
 // ═══════════════════════════════════════════════════════════════
 
-function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focused, onFocus, onBuy, onSell, tf, indicators, candleData }) {
+function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focused, onFocus, onBuy, onSell, tf, indicators, candleData, chartKey, onChartReady, onChartDestroy }) {
   const containerRef = useRef(null)
   const rsiContainerRef = useRef(null)
   const candleSeriesRef = useRef(null)
@@ -244,7 +244,10 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       }
     }
 
+    if (onChartReady && chartKey) onChartReady(chartKey, chart, candleSeries)
+
     return () => {
+      if (onChartDestroy && chartKey) onChartDestroy(chartKey)
       chart.remove()
       if (rsiChart) rsiChart.remove()
     }
@@ -584,6 +587,33 @@ export default function TradingDashboard() {
   })
   const ws = useRef(null)
   const prevSignalCountRef = useRef(0)
+  const chartRegistryRef = useRef({})  // { [chartKey]: { chart, series } }
+  const crosshairSyncingRef = useRef(false)
+
+  const registerChart = useCallback((key, chart, series) => {
+    chartRegistryRef.current[key] = { chart, series }
+    chart.subscribeCrosshairMove(param => {
+      if (crosshairSyncingRef.current) return
+      crosshairSyncingRef.current = true
+      Object.entries(chartRegistryRef.current).forEach(([k, entry]) => {
+        if (k === key || !entry) return
+        try {
+          if (param.time !== undefined) {
+            const raw = param.seriesData?.get(series)
+            const priceVal = raw?.close ?? raw?.value ?? 0
+            entry.chart.setCrosshairPosition(priceVal, param.time, entry.series)
+          } else {
+            entry.chart.clearCrosshairPosition()
+          }
+        } catch(_) {}
+      })
+      crosshairSyncingRef.current = false
+    })
+  }, [])
+
+  const unregisterChart = useCallback((key) => {
+    delete chartRegistryRef.current[key]
+  }, [])
 
   const layout = LAYOUTS[layoutIdx]
   const visibleCount = layout.cols * layout.rows
@@ -726,6 +756,7 @@ export default function TradingDashboard() {
             return (
               <RealtimeChart
                 key={`${p.code}-${idx}`}
+                chartKey={`${p.code}-${idx}`}
                 code={p.code}
                 title={p.title}
                 price={p.code === 'KOSPI' ? state?.kospi : state?.prices?.[p.code]}
@@ -739,6 +770,8 @@ export default function TradingDashboard() {
                 tf={tf}
                 indicators={indicators}
                 candleData={candleData}
+                onChartReady={registerChart}
+                onChartDestroy={unregisterChart}
               />
             )
           })}
