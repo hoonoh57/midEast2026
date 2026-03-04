@@ -182,24 +182,60 @@ class Server32Client:
         self.account_no = None
         self.session = requests.Session()
         self.session.timeout = 10
+        self._consecutive_failures = 0
+        self._max_failures = 5
+        self._backoff_until: Optional[datetime] = None
+
+    def _check_backoff(self) -> bool:
+        """backoff 기간 중이면 True 반환 (호출 차단)"""
+        if self._backoff_until and datetime.now() < self._backoff_until:
+            remaining = (self._backoff_until - datetime.now()).seconds
+            log.warning(f"⏸ API backoff 중 — {remaining}초 대기 (키움 자동 중지 방지)")
+            return True
+        return False
+
+    def _on_success(self):
+        self._consecutive_failures = 0
+        self._backoff_until = None
+
+    def _on_failure(self):
+        self._consecutive_failures += 1
+        if self._consecutive_failures >= self._max_failures:
+            wait = min(60 * self._consecutive_failures, 600)  # 최대 10분
+            self._backoff_until = datetime.now() + timedelta(seconds=wait)
+            log.error(f"🚨 API 연속 {self._consecutive_failures}회 실패 → {wait}초 backoff 설정")
 
     def _get(self, path, params=None) -> dict:
+        if self._check_backoff():
+            return {'Success': False, 'Message': 'backoff', 'Data': None}
         try:
             r = self.session.get(f"{self.base}{path}", params=params)
             data = r.json()
             if not data.get('Success'):
                 log.warning(f"API 실패: {path} → {data.get('Message')}")
+                self._on_failure()
+            else:
+                self._on_success()
             return data
         except Exception as e:
             log.error(f"API 오류: {path} → {e}")
+            self._on_failure()
             return {'Success': False, 'Message': str(e), 'Data': None}
 
     def _post(self, path, body) -> dict:
+        if self._check_backoff():
+            return {'Success': False, 'Message': 'backoff', 'Data': None}
         try:
             r = self.session.post(f"{self.base}{path}", json=body)
-            return r.json()
+            data = r.json()
+            if not data.get('Success'):
+                self._on_failure()
+            else:
+                self._on_success()
+            return data
         except Exception as e:
             log.error(f"POST 오류: {path} → {e}")
+            self._on_failure()
             return {'Success': False, 'Message': str(e), 'Data': None}
 
     # ── 인증/상태 ──
@@ -1588,6 +1624,7 @@ def _update_web_state(engine: 'WarAdaptiveEngine', holdings: list, all_signals: 
         "usdkrw": engine.ext.usdkrw,
         "news_sentiment": engine.ext.news_sentiment,
         "prices": dict(rt_prices),
+        "kospi": rt_prices.get('KOSPI', 0),
         "holdings": holdings_web,
         "signals": signals_web,
         "whipsaw_status": ws_status,
