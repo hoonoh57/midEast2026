@@ -8,6 +8,10 @@ demo_server.py — server32/키움 없이 웹 대시보드 단독 테스트
 접속: http://localhost:5000
 """
 
+import sys, io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
 import asyncio
 import random
 import time

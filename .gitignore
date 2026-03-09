@@ -29,3 +29,8 @@ Thumbs.db
 # OS
 .DS_Store
 desktop.ini
+trade_logs/
+frontend/node_modules/
+.claude/
+midEast2026/
+/package-lock.json

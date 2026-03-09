@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { createChart, ColorType, CandlestickSeries, HistogramSeries, LineSeries } from 'lightweight-charts'
+import { createChart, createSeriesMarkers, ColorType, CandlestickSeries, HistogramSeries, LineSeries } from 'lightweight-charts'
 
 // ═══════════════════════════════════════════════════════════════
 // 상수
@@ -22,15 +22,59 @@ const LAYOUTS = [
   { id: '3×3', cols: 3, rows: 3 },
 ]
 const DEFAULT_CODES = ['KOSPI','005930','000660','012450','079550','010950','096770','272210','064350']
+const DEFAULT_THEME_ITEMS = DEFAULT_CODES.map(code => ({
+  code,
+  enabled: true,
+  description: '',
+  trade_focus: '',
+  risk_note: '',
+}))
+const DEFAULT_THEMES = [{ name: 'IranWar', codes: DEFAULT_CODES, items: DEFAULT_THEME_ITEMS }]
 const TIMEFRAMES = ['m1','m3','m5','m10','m15','m60','D']
 const TF_LABELS = { m1:'1분', m3:'3분', m5:'5분', m10:'10분', m15:'15분', m60:'1시간', D:'일봉' }
+const INDICATOR_COLORS = {
+  supertrendUp: '#22c55e',
+  supertrendDown: '#ff4d6d',
+  jmaUp: '#00d4ff',
+  jmaDown: '#ff9f1c',
+}
 
 function makePanels(codes) {
   return codes.map(code => ({ code, title: code === 'KOSPI' ? 'KOSPI 지수' : (STOCK_NAMES[code] || code) }))
 }
-function calcQty(code, price) {
+function normalizeThemes(themes) {
+  const items = Array.isArray(themes) ? themes : []
+  const normalized = items
+    .map(theme => {
+      const rawItems = Array.isArray(theme?.items) && theme.items.length
+        ? theme.items
+        : (theme?.codes || []).map(code => ({ code }))
+      const seen = new Set()
+      const mappedItems = rawItems
+        .map(item => ({
+          code: String(item?.code || '').trim(),
+          enabled: item?.enabled !== false,
+          description: String(item?.description || '').trim(),
+          trade_focus: String(item?.trade_focus || '').trim(),
+          risk_note: String(item?.risk_note || '').trim(),
+        }))
+        .filter(item => {
+          if (!item.code || seen.has(item.code)) return false
+          seen.add(item.code)
+          return true
+        })
+      return {
+        name: String(theme?.name || '').trim(),
+        codes: mappedItems.map(item => item.code),
+        items: mappedItems,
+      }
+    })
+    .filter(theme => theme.name && theme.items.length > 0)
+  return normalized.length ? normalized : DEFAULT_THEMES
+}
+function calcQty(code, price, budget = 5000000) {
   if (!price || price <= 0) return 1
-  return Math.max(1, Math.floor(5_000_000 / price))
+  return Math.max(1, Math.floor(budget / price))
 }
 function kstTimeFormatter(time) {
   const d = new Date((time + 9 * 3600) * 1000)
@@ -178,7 +222,7 @@ function calcJMA(candles, period = 7, phase = 50, power = 2) {
 // 실시간 캔들 차트 + SuperTrend + JMA + RSI
 // ═══════════════════════════════════════════════════════════════
 
-function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focused, onFocus, onBuy, onSell, tf, indicators, candleData, chartKey, onChartReady, onChartDestroy }) {
+function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, positionOverlay, signalMarkers, focused, onFocus, onBuy, onSell, tf, indicators, onToggleIndicator, candleData, chartKey, onChartReady, onChartDestroy }) {
   const containerRef = useRef(null)
   const candleSeriesRef = useRef(null)
   const volumeSeriesRef = useRef(null)
@@ -191,6 +235,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
   const chartRef = useRef(null)
   const candlesRef = useRef([])        // 현재 캔들 데이터 (RSI 실시간 계산용)
   const indicatorsRef = useRef(indicators) // 최신 indicators 참조 (stale closure 방지)
+  const redrawIndicatorsRef = useRef(null)
   const [rsiValue, setRsiValue] = useState(null)
   const [stTrend, setStTrend] = useState(null) // 1=bull, -1=bear
 
@@ -225,10 +270,30 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       candleSeries.createPriceLine({ price: prevPrice, color: '#ffffff44', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '전일' })
     }
     if (buyLevels) {
-      if (buyLevels.L1) candleSeries.createPriceLine({ price: buyLevels.L1, color: '#00cc6688', lineWidth: 1, lineStyle: 1, axisLabelVisible: false, title: 'L1' })
-      if (buyLevels.L2) candleSeries.createPriceLine({ price: buyLevels.L2, color: '#00aaff88', lineWidth: 1, lineStyle: 1, axisLabelVisible: false, title: 'L2' })
-      if (buyLevels.L3) candleSeries.createPriceLine({ price: buyLevels.L3, color: '#aa88ff88', lineWidth: 1, lineStyle: 1, axisLabelVisible: false, title: 'L3' })
-      if (buyLevels.stop) candleSeries.createPriceLine({ price: buyLevels.stop, color: '#ff000088', lineWidth: 2, lineStyle: 0, axisLabelVisible: false, title: '손절' })
+      if (buyLevels.L1) candleSeries.createPriceLine({ price: buyLevels.L1, color: '#00cc66aa', lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: 'L1' })
+      if (buyLevels.L2) candleSeries.createPriceLine({ price: buyLevels.L2, color: '#00aaffaa', lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: 'L2' })
+      if (buyLevels.L3) candleSeries.createPriceLine({ price: buyLevels.L3, color: '#aa88ffaa', lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: 'L3' })
+      if (buyLevels.L4) candleSeries.createPriceLine({ price: buyLevels.L4, color: '#cc66ffaa', lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: 'L4' })
+      if (buyLevels.L5) candleSeries.createPriceLine({ price: buyLevels.L5, color: '#ffaa00aa', lineWidth: 1, lineStyle: 1, axisLabelVisible: true, title: 'L5' })
+      if (buyLevels.stop) candleSeries.createPriceLine({ price: buyLevels.stop, color: '#ff0000aa', lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: '손절' })
+    }
+    if (positionOverlay?.avg_price) {
+      candleSeries.createPriceLine({ price: positionOverlay.avg_price, color: '#ffffff99', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: '매수가' })
+    }
+    if (positionOverlay?.target) {
+      candleSeries.createPriceLine({ price: positionOverlay.target, color: '#00cc6688', lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: '목표' })
+    }
+    if (positionOverlay?.atr_target) {
+      candleSeries.createPriceLine({ price: positionOverlay.atr_target, color: '#00ffaa88', lineWidth: 1, lineStyle: 2, axisLabelVisible: true, title: 'ATR목표' })
+    }
+    if (positionOverlay?.stop) {
+      candleSeries.createPriceLine({ price: positionOverlay.stop, color: '#ff444488', lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: '손절' })
+    }
+    if (positionOverlay?.atr_stop) {
+      candleSeries.createPriceLine({ price: positionOverlay.atr_stop, color: '#ffcc0088', lineWidth: 2, lineStyle: 0, axisLabelVisible: true, title: 'ATR손절' })
+    }
+    if (signalMarkers?.length) {
+      createSeriesMarkers(candleSeries, signalMarkers)
     }
 
     chartRef.current = chart
@@ -251,20 +316,13 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
     }
     rsiSeriesRef.current = rsiSeries
 
-    // m1: __CANDLE_HISTORY 시드 사용 / 그 외: 서버에서 받은 candleData만 사용
-    const candles = candleData != null
-      ? candleData
-      : (tf === 'm1' ? (window.__CANDLE_HISTORY?.[code] || []) : [])
-    candlesRef.current = [...candles]
-    if (candles.length > 0) {
-      candleSeries.setData(candles)
-      const avgVol = candles.reduce((s, c) => s + (c.volume || 0), 0) / (candles.length || 1)
-      volumeSeries.setData(candles.map(c => ({
-        time: c.time, value: c.volume || 0,
-        color: (c.volume || 0) > avgVol * 2 ? '#ffcc0099'
-             : c.close >= c.open ? '#ef535066' : '#2962ff66',
-      })))
-      lastBarRef.current = { ...candles[candles.length - 1] }
+    const redrawIndicators = (candles) => {
+      stSeriesListRef.current.forEach(({ series }) => chart.removeSeries(series))
+      jmaSeriesListRef.current.forEach(({ series }) => chart.removeSeries(series))
+      stSeriesListRef.current = []
+      jmaSeriesListRef.current = []
+      stStateRef.current = null
+      jmaStateRef.current = null
 
       if (indicators.supertrend.enabled && candles.length >= indicators.supertrend.period) {
         const { data: stData, state: stState } = calcSuperTrend(
@@ -274,13 +332,15 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         const segments = segmentByTrend(stData)
         stSeriesListRef.current = segments.map(seg => {
           const s = chart.addSeries(LineSeries, {
-            color: seg.isUptrend ? '#00e676' : '#ff5252',
-            lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+            color: seg.isUptrend ? INDICATOR_COLORS.supertrendUp : INDICATOR_COLORS.supertrendDown,
+            lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
           })
           s.setData(seg.points)
           return { series: s, isUptrend: seg.isUptrend }
         })
         if (stData.length > 0) setStTrend(stData[stData.length - 1].isUptrend ? 1 : -1)
+      } else {
+        setStTrend(null)
       }
 
       if (indicators.jma.enabled && candles.length >= indicators.jma.period) {
@@ -290,8 +350,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         jmaStateRef.current = jmaState
         jmaSeriesListRef.current = segmentByTrend(jmaData).map(seg => {
           const s = chart.addSeries(LineSeries, {
-            color: seg.isUptrend ? '#00e5ff' : '#ff6e40',
-            lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
+            color: seg.isUptrend ? INDICATOR_COLORS.jmaUp : INDICATOR_COLORS.jmaDown,
+            lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
           })
           s.setData(seg.points)
           return { series: s, isUptrend: seg.isUptrend }
@@ -302,17 +362,59 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         const rsi = calcRSI(candles, indicators.rsi.period)
         rsiSeries.setData(rsi)
         const lastRsi = rsi[rsi.length - 1]
-        if (lastRsi) setRsiValue(lastRsi.value)
+        setRsiValue(lastRsi ? lastRsi.value : null)
+      } else {
+        setRsiValue(null)
       }
+    }
+
+    redrawIndicatorsRef.current = redrawIndicators
+
+    const applyCandles = (candles) => {
+      candlesRef.current = [...candles]
+      if (candles.length === 0) return
+
+      candleSeries.setData(candles)
+      const avgVol = candles.reduce((s, c) => s + (c.volume || 0), 0) / (candles.length || 1)
+      volumeSeries.setData(candles.map(c => ({
+        time: c.time, value: c.volume || 0,
+        color: (c.volume || 0) > avgVol * 2 ? '#ffcc0099'
+             : c.close >= c.open ? '#ef535066' : '#2962ff66',
+      })))
+      lastBarRef.current = { ...candles[candles.length - 1] }
+      redrawIndicators(candles)
+    }
+
+    // m1: __CANDLE_HISTORY 시드 사용 / 그 외: 서버에서 받은 candleData만 사용
+    const candles = candleData != null
+      ? candleData
+      : (tf === 'm1' ? (window.__CANDLE_HISTORY?.[code] || []) : [])
+    applyCandles(candles)
+
+    let cancelled = false
+    if (tf === 'm1' && candles.length < 30) {
+      fetch(`/api/candles/${code}?tf=m1`)
+        .then(resp => resp.ok ? resp.json() : Promise.reject(new Error(`HTTP ${resp.status}`)))
+        .then(json => {
+          const fetched = Array.isArray(json.candles) ? json.candles : []
+          if (!cancelled && fetched.length > candles.length) {
+            applyCandles(fetched)
+          }
+        })
+        .catch(err => {
+          console.error(`m1 candle bootstrap failed for ${code}:`, err)
+        })
     }
 
     if (onChartReady && chartKey) onChartReady(chartKey, chart, candleSeries)
 
     return () => {
+      cancelled = true
+      redrawIndicatorsRef.current = null
       if (onChartDestroy && chartKey) onChartDestroy(chartKey)
       chart.remove()
     }
-  }, [code, prevPrice, JSON.stringify(buyLevels), tf, JSON.stringify(indicators), candleData])
+  }, [code, prevPrice, JSON.stringify(buyLevels), JSON.stringify(positionOverlay), JSON.stringify(signalMarkers), tf, JSON.stringify(indicators), candleData])
 
   // indicatorsRef 최신 유지
   useEffect(() => { indicatorsRef.current = indicators }, [indicators])
@@ -345,93 +447,8 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
       candlesRef.current = [...candlesRef.current, newBar]
     }
 
-    // RSI 마지막 값만 증분 업데이트
-    const rsiCfg = indicatorsRef.current?.rsi
-    if (rsiSeriesRef.current && rsiCfg?.enabled && candlesRef.current.length > rsiCfg.period) {
-      const rsiData = calcRSI(candlesRef.current, rsiCfg.period)
-      const lastRsi = rsiData[rsiData.length - 1]
-      if (lastRsi) {
-        rsiSeriesRef.current.update(lastRsi)
-        setRsiValue(lastRsi.value)
-      }
-    }
-
-    // SuperTrend 증분 업데이트 — O(1)
-    const stCfg = indicatorsRef.current?.supertrend
-    if (stSeriesListRef.current.length > 0 && stStateRef.current && stCfg?.enabled) {
-      const candles = candlesRef.current
-      const st = stStateRef.current
-      const last = candles[candles.length - 1]
-      const prev = candles.length >= 2 ? candles[candles.length - 2] : last
-
-      const tr = Math.max(
-        last.high - last.low,
-        Math.abs(last.high - prev.close),
-        Math.abs(last.low - prev.close)
-      )
-      const newAtr = (st.lastAtr * (stCfg.period - 1) + tr) / stCfg.period
-      const hl2 = (last.high + last.low) / 2
-      const basicUpper = hl2 + stCfg.multiplier * newAtr
-      const basicLower = hl2 - stCfg.multiplier * newAtr
-
-      let { upperBand, lowerBand, isUptrend } = st
-      upperBand = basicUpper < upperBand || prev.close > upperBand ? basicUpper : upperBand
-      lowerBand = basicLower > lowerBand || prev.close < lowerBand ? basicLower : lowerBand
-
-      const wasUp = isUptrend
-      isUptrend = wasUp ? last.close >= lowerBand : last.close > upperBand
-      const supertrend = isUptrend ? lowerBand : upperBand
-      const point = { time: last.time, value: supertrend }
-      const lastEntry = stSeriesListRef.current[stSeriesListRef.current.length - 1]
-
-      if (wasUp === isUptrend) {
-        lastEntry.series.update(point)
-      } else {
-        lastEntry.series.update(point)  // 이전 추세선 끝점 연결
-        const newSeries = chartRef.current.addSeries(LineSeries, {
-          color: isUptrend ? '#00e676' : '#ff5252',
-          lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
-        })
-        newSeries.setData([point])
-        stSeriesListRef.current.push({ series: newSeries, isUptrend })
-      }
-      stStateRef.current = { upperBand, lowerBand, isUptrend, supertrend, lastAtr: newAtr, prevClose: last.close }
-      setStTrend(isUptrend ? 1 : -1)
-    }
-
-    // JMA 증분 업데이트 — O(1)
-    const jmaCfg = indicatorsRef.current?.jma
-    if (jmaSeriesListRef.current.length > 0 && jmaStateRef.current && jmaCfg?.enabled) {
-      const jst = jmaStateRef.current
-      const src = candlesRef.current[candlesRef.current.length - 1].close
-      const time = candlesRef.current[candlesRef.current.length - 1].time
-
-      const phaseRatio = jmaCfg.phase < -100 ? 0.5 : jmaCfg.phase > 100 ? 2.5 : jmaCfg.phase / 100 + 1.5
-      const beta = 0.45 * (jmaCfg.period - 1) / (0.45 * (jmaCfg.period - 1) + 2)
-      const alpha = Math.pow(beta, jmaCfg.power)
-
-      jst.e0 = (1 - alpha) * src + alpha * jst.e0
-      jst.e1 = (src - jst.e0) * (1 - beta) + beta * jst.e1
-      jst.e2 = (jst.e0 + phaseRatio * jst.e1 - jst.prevJMA) * Math.pow(1 - alpha, 2) + Math.pow(alpha, 2) * jst.e2
-
-      const jma = Math.round((jst.e2 + jst.prevJMA) * 10) / 10
-      const isUptrend = jma > jst.prevJMA ? true : jma < jst.prevJMA ? false : jst.lastIsUptrend
-      const point = { time, value: jma }
-      const lastEntry = jmaSeriesListRef.current[jmaSeriesListRef.current.length - 1]
-
-      if (lastEntry.isUptrend === isUptrend) {
-        lastEntry.series.update(point)
-      } else {
-        lastEntry.series.update(point)
-        const newSeries = chartRef.current.addSeries(LineSeries, {
-          color: isUptrend ? '#00e5ff' : '#ff6e40',
-          lineWidth: 2, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false,
-        })
-        newSeries.setData([point])
-        jmaSeriesListRef.current.push({ series: newSeries, isUptrend })
-      }
-      jst.prevJMA = jma
-      jst.lastIsUptrend = isUptrend
+    if (redrawIndicatorsRef.current) {
+      redrawIndicatorsRef.current(candlesRef.current)
     }
   }, [price, tf])
 
@@ -440,6 +457,9 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
   const flagColor = { emergency:'#ff0000', crash:'#ff4444', near_limit:'#ffaa00', normal:'#00cc66' }[whipsaw?.flag] || '#333'
   const borderColor = focused ? '#ffcc00' : flagColor
   const isBuyDisabled = whipsaw?.flag === 'near_limit' || whipsaw?.flag === 'emergency'
+  const handleToggle = (key, checked) => {
+    if (onToggleIndicator) onToggleIndicator(key, checked)
+  }
 
   return (
     <div onClick={onFocus} style={{
@@ -462,7 +482,20 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
         {indicators.rsi.enabled && rsiValue !== null && (
           <span style={{ fontSize: 8, color: rsiValue >= 70 ? '#ff4444' : rsiValue <= 30 ? '#00cc66' : '#e0aa00' }}>RSI {rsiValue}</span>
         )}
-        <div style={{ marginLeft: 'auto', display: 'flex', gap: 3 }} onClick={e => e.stopPropagation()}>
+        <div style={{ marginLeft: 'auto', display: 'flex', gap: 8, alignItems:'center' }} onClick={e => e.stopPropagation()}>
+          <label style={{ display:'flex', alignItems:'center', gap:2, fontSize:8, color: indicators.supertrend.enabled ? '#ccc' : '#555', cursor:'pointer' }}>
+            <input type="checkbox" checked={indicators.supertrend.enabled} onChange={e => handleToggle('supertrend', e.target.checked)} />
+            <span>ST</span>
+          </label>
+          <label style={{ display:'flex', alignItems:'center', gap:2, fontSize:8, color: indicators.jma.enabled ? '#ccc' : '#555', cursor:'pointer' }}>
+            <input type="checkbox" checked={indicators.jma.enabled} onChange={e => handleToggle('jma', e.target.checked)} />
+            <span>JMA</span>
+          </label>
+          <label style={{ display:'flex', alignItems:'center', gap:2, fontSize:8, color: indicators.rsi.enabled ? '#ccc' : '#555', cursor:'pointer' }}>
+            <input type="checkbox" checked={indicators.rsi.enabled} onChange={e => handleToggle('rsi', e.target.checked)} />
+            <span>RSI</span>
+          </label>
+          <div style={{ display: 'flex', gap: 3 }}>
           <button onClick={onBuy} disabled={isBuyDisabled} style={{
             background: '#003300', color: '#0f0', border: '1px solid #060',
             padding: '1px 5px', fontSize: 9, cursor: 'pointer', borderRadius: 2, opacity: isBuyDisabled ? 0.3 : 1,
@@ -471,6 +504,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, focu
             background: '#330000', color: '#f44', border: '1px solid #600',
             padding: '1px 5px', fontSize: 9, cursor: 'pointer', borderRadius: 2,
           }}>매도</button>
+          </div>
         </div>
       </div>
       <div ref={containerRef} style={{ flex: 1, minHeight: 0 }} />
@@ -513,17 +547,25 @@ function PnlSparkline({ history }) {
 
 function MacroBar({ state }) {
   if (!state) return null
-  const { regime, beta, war_day, wti, usdkrw, daily_pnl, auto_trading, news_sentiment, pnl_history } = state
+  const { regime, beta, war_day, wti, usdkrw, daily_pnl, auto_trading, news_sentiment, pnl_history, account_no, orderable_cash, data_health, data_readiness } = state
   const pnlColor = daily_pnl >= 0 ? '#00cc66' : '#ff4444'
   const rc = { EXTREME_CRISIS:'#ff0000', CRISIS:'#ff2222', CAUTIOUS:'#ffaa00', RECOVERY:'#00cc66', AGGRESSIVE:'#00ff44' }
+  const acctSuffix = account_no ? String(account_no).slice(-4) : '----'
+  const healthColor = data_health?.status === 'critical' ? '#fda4af' : data_health?.status === 'warning' ? '#facc15' : '#86efac'
+  const readinessColor = data_readiness?.ready ? '#86efac' : '#facc15'
   return (
     <div style={{ display:'flex', alignItems:'center', gap:14, padding:'3px 12px', background:'#0d0d1a', borderBottom:'1px solid #222', fontSize:11, flexWrap:'wrap', flexShrink:0 }}>
+      <span style={{ color:'#7dd3fc', fontWeight:'bold', background:'#082f49', border:'1px solid #0ea5e9', padding:'1px 6px', borderRadius:999 }}>
+        모의실전 ACC {acctSuffix} 주문가능 {Number(orderable_cash || 0).toLocaleString()}원
+      </span>
       <span style={{ color: rc[regime] || '#888', fontWeight:'bold' }}>● {regime}</span>
       <span>β <b>{beta?.toFixed(2)}</b></span>
       <span>D+<b>{war_day}</b></span>
       <span>WTI <b>${wti?.toFixed(1)}</b></span>
       <span>환율 <b>{usdkrw?.toFixed(0)}₩</b></span>
       <span style={{ fontSize:10, color: news_sentiment?.startsWith('NEG') ? '#ff6666' : news_sentiment?.startsWith('POS') ? '#66ff99' : '#888' }}>뉴스:{news_sentiment}</span>
+      <span style={{ color:healthColor, fontWeight:'bold' }}>DATA:{data_health?.status || 'unknown'} {data_health?.reason ? `(${data_health.reason})` : ''}</span>
+      <span style={{ color:readinessColor, fontWeight:'bold' }}>CANDLES:{data_readiness?.status || 'unknown'} {data_readiness?.reason ? `(${data_readiness.reason})` : ''}</span>
       <span style={{ marginLeft:'auto', display:'flex', alignItems:'center', gap:6 }}>
         <PnlSparkline history={pnl_history} />
         <span style={{ color: pnlColor, fontWeight:'bold', fontSize:14, background: daily_pnl >= 0 ? '#003310' : '#330008', padding:'1px 6px', borderRadius:3 }}>
@@ -547,6 +589,26 @@ function WhipsawBanner({ status, phase }) {
   )
 }
 
+function DataHealthBanner({ health, readiness }) {
+  const showHealth = health && health.status !== 'ok' && health.status !== 'unknown'
+  const showReadiness = readiness && readiness.ready === false
+  if (!showHealth && !showReadiness) return null
+  const bg = health?.status === 'critical' ? '#3f0a0a' : '#3a2a05'
+  const border = health?.status === 'critical' ? '#7f1d1d' : '#a16207'
+  const color = health?.status === 'critical' ? '#fecaca' : '#fde68a'
+  return (
+    <div style={{ display:'flex', gap:12, padding:'4px 12px', flexWrap:'wrap', flexShrink:0, background:bg, borderBottom:`1px solid ${border}`, fontSize:10 }}>
+      <span style={{ color, fontWeight:'bold' }}>비상 데이터 경고</span>
+      <span style={{ color }}>{health.reason}</span>
+      {showReadiness ? <span style={{ color:'#fde68a' }}>캔들준비: {readiness.reason}</span> : null}
+      {health.last_error ? <span style={{ color:'#fca5a5' }}>오류: {health.last_error}</span> : null}
+      {health.last_tick_at ? <span style={{ color:'#ddd' }}>마지막 틱 {new Date(health.last_tick_at).toLocaleTimeString('ko-KR', { hour12:false })}</span> : null}
+      {health.last_bar_at ? <span style={{ color:'#ddd' }}>마지막 신규봉 {new Date(health.last_bar_at).toLocaleTimeString('ko-KR', { hour12:false })}</span> : null}
+      {health.stale_count ? <span style={{ color:'#fca5a5' }}>지연 종목 {health.stale_count}개</span> : null}
+    </div>
+  )
+}
+
 // ═══════════════════════════════════════════════════════════════
 // 긴급매도 확인 다이얼로그
 // ═══════════════════════════════════════════════════════════════
@@ -563,6 +625,33 @@ function SellConfirmDialog({ code, name, onConfirm, onCancel }) {
           <button onClick={onCancel} style={{ padding:'6px 20px', fontSize:12, cursor:'pointer', background:'#333', color:'#ccc', border:'1px solid #555', borderRadius:4 }}>취소</button>
           <button onClick={onConfirm} disabled={cd>0} style={{ padding:'6px 20px', fontSize:12, cursor:cd>0?'not-allowed':'pointer', background:cd>0?'#660000':'#cc0000', color:'#fff', border:'1px solid #ff0000', borderRadius:4, opacity:cd>0?0.6:1 }}>
             {cd > 0 ? `확인 (${cd}초)` : '매도 실행'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function BuyConfirmDialog({ order, onConfirm, onCancel }) {
+  if (!order) return null
+  const holdingText = order.holdingQty > 0
+    ? `현재 보유 ${order.holdingQty.toLocaleString()}주 / 평균단가 ${order.holdingAvg.toLocaleString()}원`
+    : '현재 보유 없음'
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.7)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:9999 }}>
+      <div style={{ background:'#001018', border:'2px solid #0ea5e9', borderRadius:8, padding:'18px 24px', textAlign:'center', color:'#fff', minWidth:320 }}>
+        <div style={{ fontSize:16, fontWeight:'bold', color:'#67e8f9', marginBottom:10 }}>수동 매수 확인</div>
+        <div style={{ fontSize:13, marginBottom:8 }}><b>{order.name}</b> ({order.code})</div>
+        <div style={{ fontSize:12, color:'#cbd5e1', lineHeight:1.8, marginBottom:14 }}>
+          <div>주문가 {order.price.toLocaleString()}원</div>
+          <div>수량 {order.qty.toLocaleString()}주</div>
+          <div>예상 금액 {(order.price * order.qty).toLocaleString()}원</div>
+          <div>{holdingText}</div>
+        </div>
+        <div style={{ display:'flex', gap:12, justifyContent:'center' }}>
+          <button onClick={onCancel} style={{ padding:'6px 20px', fontSize:12, cursor:'pointer', background:'#333', color:'#ccc', border:'1px solid #555', borderRadius:4 }}>취소</button>
+          <button onClick={onConfirm} style={{ padding:'6px 20px', fontSize:12, cursor:'pointer', background:'#082f49', color:'#7dd3fc', border:'1px solid #0ea5e9', borderRadius:4 }}>
+            매수 실행
           </button>
         </div>
       </div>
@@ -668,10 +757,392 @@ function IndicatorSettings({ indicators, onChange }) {
 // 우측 사이드 패널
 // ═══════════════════════════════════════════════════════════════
 
-function SidePanel({ state, panels, focusedIdx, onChangeFocused, onChangePanel, tf, onChangeTF, indicators, onChangeIndicators }) {
+const STRATEGIES = [
+  { id: 'macro', label: 'Chart1: 매크로 국면', desc: 'Regime→beta' },
+  { id: 'defense', label: 'Chart2: 방산 스캘핑', desc: 'VWAP+RSI+BB' },
+  { id: 'energy', label: 'Chart3: 에너지 유가', desc: 'WTI+뉴스' },
+  { id: 'semi', label: 'Chart4: 반도체 역발상', desc: '분할매수' },
+]
+
+const TRADE_PRESETS = {
+  total: [1000000, 3000000, 5000000, 10000000],
+  perStock: [100000, 300000, 500000, 1000000],
+}
+
+function formatBudget(v) {
+  return `${Number(v || 0).toLocaleString()}원`
+}
+
+function formatBudgetCompact(v) {
+  if (v >= 100000000) return `${(v / 100000000).toFixed(1)}억`
+  if (v >= 10000) return `${(v / 10000).toLocaleString()}만`
+  return `${v.toLocaleString()}원`
+}
+
+function parseBudgetInput(value, fallback) {
+  const digits = String(value ?? '').replace(/[^\d]/g, '')
+  const parsed = parseInt(digits, 10)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function AutoTradeConfigDialog({ config, autoOn, onClose, onToggleAuto, onApply }) {
+  const [totalBudget, setTotalBudget] = useState(config?.total_budget ?? 5000000)
+  const [perStock, setPerStock] = useState(config?.per_stock ?? 1000000)
+  const [strategies, setStrategies] = useState(config?.strategies ?? { macro: true, defense: true, energy: true, semi: true })
+
+  useEffect(() => {
+    if (!config) return
+    setTotalBudget(config.total_budget ?? 5000000)
+    setPerStock(config.per_stock ?? 1000000)
+    setStrategies({ macro: true, defense: true, energy: true, semi: true, ...(config.strategies || {}) })
+  }, [config])
+
+  return (
+    <div onClick={onClose} style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.72)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:10000 }}>
+      <div onClick={e => e.stopPropagation()} style={{ width:420, maxWidth:'calc(100vw - 24px)', background:'#090c14', border:'1px solid #334155', boxShadow:'0 24px 80px rgba(0,0,0,0.45)', borderRadius:10, overflow:'hidden' }}>
+        <div style={{ padding:'14px 16px', borderBottom:'1px solid #1e293b', display:'flex', alignItems:'center', justifyContent:'space-between' }}>
+          <div>
+            <div style={{ fontSize:14, color:'#e5e7eb', fontWeight:'bold' }}>자동매매 실전 설정</div>
+            <div style={{ fontSize:11, color:'#94a3b8', marginTop:2 }}>소액 계좌도 바로 조정 가능한 입력형 설정</div>
+          </div>
+          <button onClick={onClose} style={{ background:'#111827', color:'#94a3b8', border:'1px solid #334155', borderRadius:6, padding:'4px 8px', cursor:'pointer' }}>닫기</button>
+        </div>
+
+        <div style={{ padding:'16px', display:'flex', flexDirection:'column', gap:14 }}>
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', padding:'10px 12px', background:'#0f172a', border:'1px solid #1e293b', borderRadius:8 }}>
+            <div>
+              <div style={{ fontSize:11, color:'#94a3b8' }}>자동매매 상태</div>
+              <div style={{ fontSize:13, color:autoOn ? '#22c55e' : '#f87171', fontWeight:'bold', marginTop:2 }}>{autoOn ? '실행 중' : '중지'}</div>
+            </div>
+            <button onClick={onToggleAuto} style={{ padding:'8px 12px', borderRadius:6, cursor:'pointer', fontSize:12, fontWeight:'bold', background:autoOn ? '#2a0b0b' : '#052e16', color:autoOn ? '#f87171' : '#4ade80', border:`1px solid ${autoOn ? '#7f1d1d' : '#166534'}` }}>
+              {autoOn ? '자동매매 중지' : '자동매매 시작'}
+            </button>
+          </div>
+
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:12 }}>
+            <label style={{ display:'block' }}>
+              <div style={{ fontSize:11, color:'#94a3b8', marginBottom:5 }}>총 투자금</div>
+              <input type="text" value={totalBudget.toLocaleString()} onChange={e => setTotalBudget(parseBudgetInput(e.target.value, totalBudget))} style={{ width:'100%', background:'#020617', color:'#e5e7eb', border:'1px solid #334155', borderRadius:6, padding:'8px 10px', fontSize:13 }} />
+              <div style={{ fontSize:10, color:'#38bdf8', marginTop:4 }}>{formatBudget(totalBudget)} / {formatBudgetCompact(totalBudget)}</div>
+            </label>
+            <label style={{ display:'block' }}>
+              <div style={{ fontSize:11, color:'#94a3b8', marginBottom:5 }}>종목당 최대 투자금</div>
+              <input type="text" value={perStock.toLocaleString()} onChange={e => setPerStock(parseBudgetInput(e.target.value, perStock))} style={{ width:'100%', background:'#020617', color:'#e5e7eb', border:'1px solid #334155', borderRadius:6, padding:'8px 10px', fontSize:13 }} />
+              <div style={{ fontSize:10, color:'#38bdf8', marginTop:4 }}>{formatBudget(perStock)} / {formatBudgetCompact(perStock)}</div>
+            </label>
+          </div>
+
+          <div>
+              <div style={{ fontSize:11, color:'#94a3b8', marginBottom:6 }}>빠른 총 투자금</div>
+              <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+              {TRADE_PRESETS.total.map(v => (
+                <button key={v} onClick={() => setTotalBudget(v)} style={{ padding:'5px 8px', borderRadius:999, cursor:'pointer', background:totalBudget === v ? '#082f49' : '#111827', color:totalBudget === v ? '#7dd3fc' : '#94a3b8', border:`1px solid ${totalBudget === v ? '#0ea5e9' : '#334155'}`, fontSize:11 }}>
+                  {formatBudgetCompact(v)}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+              <div style={{ fontSize:11, color:'#94a3b8', marginBottom:6 }}>빠른 종목당 투자금</div>
+              <div style={{ display:'flex', gap:6, flexWrap:'wrap' }}>
+              {TRADE_PRESETS.perStock.map(v => (
+                <button key={v} onClick={() => setPerStock(v)} style={{ padding:'5px 8px', borderRadius:999, cursor:'pointer', background:perStock === v ? '#1e293b' : '#111827', color:perStock === v ? '#facc15' : '#94a3b8', border:`1px solid ${perStock === v ? '#ca8a04' : '#334155'}`, fontSize:11 }}>
+                  {formatBudgetCompact(v)}
+                </button>
+              ))}
+            </div>
+          </div>
+
+          <div>
+            <div style={{ fontSize:11, color:'#94a3b8', marginBottom:6 }}>전략 사용 여부</div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
+              {STRATEGIES.map(s => (
+                <label key={s.id} style={{ display:'flex', alignItems:'center', gap:8, padding:'8px 10px', cursor:'pointer', background:'#0f172a', border:'1px solid #1e293b', borderRadius:8, color:strategies[s.id] ? '#e5e7eb' : '#64748b' }}>
+                  <input type="checkbox" checked={!!strategies[s.id]} onChange={e => setStrategies(prev => ({ ...prev, [s.id]: e.target.checked }))} />
+                  <span style={{ fontSize:12 }}>{s.label}</span>
+                </label>
+              ))}
+            </div>
+          </div>
+        </div>
+
+        <div style={{ padding:'12px 16px', borderTop:'1px solid #1e293b', display:'flex', justifyContent:'space-between', alignItems:'center', gap:10 }}>
+          <div style={{ fontSize:11, color:'#94a3b8' }}>적용값: 총 {formatBudget(totalBudget)} / 종목당 {formatBudget(perStock)}</div>
+          <button onClick={() => onApply({ total_budget: totalBudget, per_stock: perStock, strategies })} style={{ padding:'9px 14px', borderRadius:6, cursor:'pointer', fontSize:12, fontWeight:'bold', background:'#082f49', color:'#7dd3fc', border:'1px solid #0ea5e9' }}>
+            설정 저장
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function AutoTradeSettings({ state, onSend, onApplyConfig }) {
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const autoOn = state?.auto_trading ?? false
+  const tradeConfig = state?.trade_config
+  const blockedReason = state?.data_health?.status !== 'ok'
+    ? state?.data_health?.reason
+    : (state?.data_readiness?.ready === false ? state?.data_readiness?.reason : '')
+  const toggleAuto = () => {
+    if (!autoOn && blockedReason) return
+    onSend({ cmd: 'toggle_auto', enabled: !autoOn })
+  }
+  const totalBudget = tradeConfig?.total_budget ?? 5000000
+  const perStock = tradeConfig?.per_stock ?? 1000000
+  const enabledStrategies = Object.entries(tradeConfig?.strategies || { macro: true, defense: true, energy: true, semi: true }).filter(([, enabled]) => enabled).length
+
+  return (
+    <>
+      <div style={{ borderBottom:'1px solid #222', padding:'8px' }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:6 }}>
+          <span style={{ fontSize:10, color:'#f59e0b' }}>자동매매 설정</span>
+          <span style={{ fontSize:9, color:autoOn ? '#22c55e' : blockedReason ? '#facc15' : '#f87171' }}>{autoOn ? 'ON' : (blockedReason ? 'BLOCKED' : 'OFF')}</span>
+        </div>
+        <div style={{ fontSize:9, color:'#94a3b8', lineHeight:1.6 }}>
+          <div>총 투자금 {formatBudget(totalBudget)}</div>
+          <div>종목당 {formatBudget(perStock)}</div>
+          <div>사용 전략 {enabledStrategies}개</div>
+        </div>
+        <button onClick={() => setDialogOpen(true)} style={{ width:'100%', marginTop:8, padding:'6px 0', cursor:'pointer', borderRadius:4, fontSize:10, background:'#111827', color:'#cbd5e1', border:'1px solid #334155' }}>
+          실전 설정 열기
+        </button>
+      </div>
+      {dialogOpen && (
+        <AutoTradeConfigDialog
+          config={tradeConfig}
+          autoOn={autoOn}
+          onClose={() => setDialogOpen(false)}
+          onToggleAuto={toggleAuto}
+          onApply={(payload) => {
+            if (onApplyConfig) onApplyConfig(payload)
+            else onSend({ cmd:'set_config', ...payload })
+            setDialogOpen(false)
+          }}
+        />
+      )}
+    </>
+  )
+}
+
+function AutoTradeQuickToggle({ autoOn, onToggle }) {
+  return (
+    <button
+      onClick={onToggle}
+      style={{
+        marginLeft: 10,
+        padding: '4px 10px',
+        borderRadius: 999,
+        cursor: 'pointer',
+        fontSize: 11,
+        fontWeight: 'bold',
+        background: autoOn ? '#2a0b0b' : '#052e16',
+        color: autoOn ? '#fda4af' : '#86efac',
+        border: `1px solid ${autoOn ? '#be123c' : '#15803d'}`,
+        boxShadow: autoOn ? '0 0 12px rgba(190,24,93,0.25)' : '0 0 12px rgba(21,128,61,0.25)',
+      }}
+      title="자동매매 즉시 ON/OFF"
+    >
+      {autoOn ? '자동매매 중지' : '자동매매 시작'}
+    </button>
+  )
+}
+
+function AutoTradeGateButton({ autoOn, onToggle, blockedReason }) {
+  const blocked = Boolean(blockedReason)
+  return (
+    <button
+      onClick={onToggle}
+      disabled={blocked && !autoOn}
+      style={{
+        marginLeft: 10,
+        padding: '4px 10px',
+        borderRadius: 999,
+        cursor: blocked && !autoOn ? 'not-allowed' : 'pointer',
+        fontSize: 11,
+        fontWeight: 'bold',
+        background: blocked && !autoOn ? '#3a2a05' : (autoOn ? '#2a0b0b' : '#052e16'),
+        color: blocked && !autoOn ? '#fde68a' : (autoOn ? '#fda4af' : '#86efac'),
+        border: `1px solid ${blocked && !autoOn ? '#a16207' : (autoOn ? '#be123c' : '#15803d')}`,
+        boxShadow: blocked && !autoOn ? 'none' : (autoOn ? '0 0 12px rgba(190,24,93,0.25)' : '0 0 12px rgba(21,128,61,0.25)'),
+        opacity: blocked && !autoOn ? 0.75 : 1,
+      }}
+      title={blocked && !autoOn ? blockedReason : '자동매매 즉시 ON/OFF'}
+    >
+      {autoOn ? '자동매매 중지' : (blocked ? '자동매매 차단' : '자동매매 시작')}
+    </button>
+  )
+}
+
+function ThemeManagerDialog({ themes, onClose, onSave, onDelete }) {
+  const [selectedName, setSelectedName] = useState(themes[0]?.name || 'IranWar')
+  const selectedTheme = themes.find(theme => theme.name === selectedName) || themes[0] || DEFAULT_THEMES[0]
+  const [draftName, setDraftName] = useState(selectedTheme?.name || 'IranWar')
+  const [draftItems, setDraftItems] = useState(selectedTheme?.items || DEFAULT_THEME_ITEMS)
+  const [focusedCode, setFocusedCode] = useState((selectedTheme?.items || DEFAULT_THEME_ITEMS)[0]?.code || 'KOSPI')
+
+  useEffect(() => {
+    const next = themes.find(theme => theme.name === selectedName) || themes[0] || DEFAULT_THEMES[0]
+    setDraftName(next?.name || '')
+    setDraftItems(next?.items || DEFAULT_THEME_ITEMS)
+    setFocusedCode((next?.items || DEFAULT_THEME_ITEMS)[0]?.code || 'KOSPI')
+  }, [selectedName, themes])
+
+  const updateItem = (code, patch) => {
+    setDraftItems(prev => prev.map(item => item.code === code ? { ...item, ...patch } : item))
+  }
+
+  const addItem = () => {
+    const nextCode = ['KOSPI', ...Object.keys(STOCK_NAMES)].find(code => !draftItems.some(item => item.code === code))
+    if (!nextCode) return
+    setDraftItems(prev => [...prev, { code: nextCode, enabled: true, description: '', trade_focus: '', risk_note: '' }])
+    setFocusedCode(nextCode)
+  }
+
+  const removeItem = (code) => {
+    const nextItems = draftItems.filter(item => item.code !== code)
+    if (nextItems.length === 0) return
+    setDraftItems(nextItems)
+    if (focusedCode === code) setFocusedCode(nextItems[0].code)
+  }
+
+  const changeCode = (oldCode, newCode) => {
+    if (draftItems.some(item => item.code === newCode && item.code !== oldCode)) return
+    setDraftItems(prev => prev.map(item => item.code === oldCode ? { ...item, code: newCode } : item))
+    if (focusedCode === oldCode) setFocusedCode(newCode)
+  }
+
+  const handleNew = () => {
+    setSelectedName('__new__')
+    setDraftName('')
+    setDraftItems([{ code: 'KOSPI', enabled: true, description: '', trade_focus: '', risk_note: '' }])
+    setFocusedCode('KOSPI')
+  }
+
+  const handleSave = () => {
+    const payload = {
+      name: draftName.trim(),
+      items: draftItems.filter(item => item.code).map(item => ({
+        code: item.code,
+        enabled: item.enabled !== false,
+        description: item.description || '',
+        trade_focus: item.trade_focus || '',
+        risk_note: item.risk_note || '',
+      })),
+    }
+    if (!payload.name || payload.items.length === 0) return
+    onSave(selectedName === '__new__' ? null : selectedTheme?.name, payload)
+  }
+
+  const handleDelete = () => {
+    if (selectedName === '__new__' || !selectedTheme?.name) return
+    onDelete(selectedTheme.name)
+  }
+
+  const focusedItem = draftItems.find(item => item.code === focusedCode) || draftItems[0]
+
+  return (
+    <div style={{ position:'fixed', inset:0, background:'rgba(0,0,0,0.72)', display:'flex', alignItems:'center', justifyContent:'center', zIndex:9999 }}>
+      <div style={{ width:980, maxWidth:'95vw', maxHeight:'90vh', overflow:'hidden', display:'grid', gridTemplateColumns:'220px 320px 1fr', background:'#0b1020', border:'1px solid #334155', borderRadius:10 }}>
+        <div style={{ borderRight:'1px solid #1e293b', padding:14, overflow:'auto' }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:10 }}>
+            <div style={{ color:'#fbbf24', fontSize:12, fontWeight:'bold' }}>테마</div>
+            <button onClick={handleNew} style={{ fontSize:10, padding:'4px 8px', background:'#082f49', color:'#7dd3fc', border:'1px solid #0ea5e9', borderRadius:6, cursor:'pointer' }}>새 테마</button>
+          </div>
+          <div style={{ display:'flex', flexDirection:'column', gap:6 }}>
+            {themes.map(theme => (
+              <button key={theme.name} onClick={() => setSelectedName(theme.name)} style={{
+                textAlign:'left', padding:'8px 10px', borderRadius:6, cursor:'pointer',
+                background: selectedName === theme.name ? '#1e293b' : '#111827',
+                color: selectedName === theme.name ? '#f8fafc' : '#94a3b8',
+                border: `1px solid ${selectedName === theme.name ? '#38bdf8' : '#1f2937'}`,
+              }}>
+                <div style={{ fontSize:11, fontWeight:'bold' }}>{theme.name}</div>
+                <div style={{ fontSize:9 }}>{theme.items?.length || theme.codes?.length || 0}종목</div>
+              </button>
+            ))}
+          </div>
+        </div>
+        <div style={{ borderRight:'1px solid #1e293b', padding:14, overflow:'auto' }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12 }}>
+            <div style={{ color:'#e2e8f0', fontSize:12, fontWeight:'bold' }}>테마 편집</div>
+            <button onClick={onClose} style={{ fontSize:10, padding:'4px 8px', background:'#111827', color:'#cbd5e1', border:'1px solid #334155', borderRadius:6, cursor:'pointer' }}>닫기</button>
+          </div>
+          <div style={{ marginBottom:12 }}>
+            <div style={{ fontSize:10, color:'#94a3b8', marginBottom:4 }}>테마명</div>
+            <input value={draftName} onChange={e => setDraftName(e.target.value)} style={{ width:'100%', background:'#020617', color:'#e2e8f0', border:'1px solid #334155', borderRadius:6, padding:'8px 10px', fontSize:12 }} />
+          </div>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:8 }}>
+            <div style={{ fontSize:10, color:'#94a3b8' }}>종목</div>
+            <button onClick={addItem} style={{ fontSize:10, padding:'4px 8px', background:'#052e16', color:'#bbf7d0', border:'1px solid #15803d', borderRadius:6, cursor:'pointer' }}>종목 추가</button>
+          </div>
+          <div style={{ display:'flex', flexDirection:'column', gap:8 }}>
+            {draftItems.map(item => (
+              <div key={item.code} style={{ display:'grid', gridTemplateColumns:'1fr auto', gap:6, padding:'8px', background: focusedCode === item.code ? '#132238' : '#111827', border:`1px solid ${focusedCode === item.code ? '#38bdf8' : '#1f2937'}`, borderRadius:8 }}>
+                <button onClick={() => setFocusedCode(item.code)} style={{ textAlign:'left', background:'transparent', border:'none', color:'#e5e7eb', cursor:'pointer', padding:0 }}>
+                  <div style={{ fontSize:11, fontWeight:'bold' }}>{STOCK_NAMES[item.code] || item.code}</div>
+                  <div style={{ fontSize:9, color:'#94a3b8' }}>{item.code}</div>
+                  <div style={{ fontSize:9, color:item.enabled ? '#86efac' : '#fca5a5' }}>{item.enabled ? '활성' : '비활성'}</div>
+                </button>
+                <button onClick={() => removeItem(item.code)} disabled={draftItems.length <= 1} style={{ fontSize:10, padding:'4px 8px', background:'#2a0b0b', color:'#fecaca', border:'1px solid #7f1d1d', borderRadius:6, cursor:draftItems.length <= 1 ? 'not-allowed' : 'pointer', opacity:draftItems.length <= 1 ? 0.5 : 1 }}>삭제</button>
+              </div>
+            ))}
+          </div>
+          <div style={{ display:'flex', justifyContent:'space-between', marginTop:16 }}>
+            <button onClick={handleDelete} disabled={selectedName === '__new__'} style={{ padding:'8px 12px', borderRadius:6, cursor:selectedName === '__new__' ? 'not-allowed' : 'pointer', background:'#2a0b0b', color:'#fecaca', border:'1px solid #7f1d1d', opacity:selectedName === '__new__' ? 0.5 : 1 }}>테마 삭제</button>
+            <button onClick={handleSave} style={{ padding:'8px 14px', borderRadius:6, cursor:'pointer', background:'#052e16', color:'#bbf7d0', border:'1px solid #15803d', fontWeight:'bold' }}>저장</button>
+          </div>
+        </div>
+        <div style={{ padding:14, overflow:'auto' }}>
+          {!focusedItem ? null : (
+            <>
+              <div style={{ color:'#e2e8f0', fontSize:12, fontWeight:'bold', marginBottom:12 }}>종목 편집</div>
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 110px', gap:10, marginBottom:12 }}>
+                <div>
+                  <div style={{ fontSize:10, color:'#94a3b8', marginBottom:4 }}>종목</div>
+                  <select value={focusedItem.code} onChange={e => changeCode(focusedItem.code, e.target.value)} style={{ width:'100%', background:'#020617', color:'#e2e8f0', border:'1px solid #334155', borderRadius:6, padding:'8px 10px', fontSize:12 }}>
+                    <option value="KOSPI">KOSPI</option>
+                    {Object.entries(STOCK_NAMES).map(([code, name]) => <option key={code} value={code}>{name} ({code})</option>)}
+                  </select>
+                </div>
+                <div>
+                  <div style={{ fontSize:10, color:'#94a3b8', marginBottom:4 }}>활성화</div>
+                  <label style={{ display:'flex', alignItems:'center', gap:8, height:40, padding:'0 10px', background:'#111827', border:'1px solid #334155', borderRadius:6, color:'#e2e8f0', fontSize:11 }}>
+                    <input type="checkbox" checked={focusedItem.enabled !== false} onChange={e => updateItem(focusedItem.code, { enabled: e.target.checked })} />
+                    <span>{focusedItem.enabled !== false ? '자동매매 대상' : '관찰 전용'}</span>
+                  </label>
+                </div>
+              </div>
+              <div style={{ marginBottom:12 }}>
+                <div style={{ fontSize:10, color:'#94a3b8', marginBottom:4 }}>종목 설명</div>
+                <textarea value={focusedItem.description || ''} onChange={e => updateItem(focusedItem.code, { description: e.target.value })} rows={3} style={{ width:'100%', resize:'vertical', background:'#020617', color:'#e2e8f0', border:'1px solid #334155', borderRadius:6, padding:'8px 10px', fontSize:12 }} />
+              </div>
+              <div style={{ marginBottom:12 }}>
+                <div style={{ fontSize:10, color:'#94a3b8', marginBottom:4 }}>매매 주안점</div>
+                <textarea value={focusedItem.trade_focus || ''} onChange={e => updateItem(focusedItem.code, { trade_focus: e.target.value })} rows={4} style={{ width:'100%', resize:'vertical', background:'#020617', color:'#e2e8f0', border:'1px solid #334155', borderRadius:6, padding:'8px 10px', fontSize:12 }} />
+              </div>
+              <div>
+                <div style={{ fontSize:10, color:'#94a3b8', marginBottom:4 }}>리스크 / 비고</div>
+                <textarea value={focusedItem.risk_note || ''} onChange={e => updateItem(focusedItem.code, { risk_note: e.target.value })} rows={4} style={{ width:'100%', resize:'vertical', background:'#020617', color:'#e2e8f0', border:'1px solid #334155', borderRadius:6, padding:'8px 10px', fontSize:12 }} />
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function SidePanel({ state, panels, focusedIdx, onChangeFocused, onChangePanel, tf, onChangeTF, indicators, onChangeIndicators, onSend, onApplyConfig, themes, selectedThemeName, onSelectTheme, onOpenThemeManager }) {
+  const [activityTab, setActivityTab] = useState('trades')
   const [sigFilter, setSigFilter] = useState('ALL')
   const signals = state?.signals || []
+  const tradeLogs = state?.trade_logs || []
   const holdings = state?.holdings || []
+  const focusCode = panels[focusedIdx]?.code
+  const focusOverlay = focusCode ? state?.position_overlays?.[focusCode] : null
+  const focusHoga = focusOverlay?.hoga ?? (focusCode ? state?.hoga_analysis?.[focusCode] : null)
   const actionColor = { BUY:'#0c6', SELL:'#f44', HOLD:'#888' }
   const filteredSignals = sigFilter === 'ALL' ? signals : signals.filter(s => s.action === sigFilter)
 
@@ -694,7 +1165,21 @@ function SidePanel({ state, panels, focusedIdx, onChangeFocused, onChangePanel, 
         </div>
       </div>
 
+      <AutoTradeSettings state={state} onSend={onSend} onApplyConfig={onApplyConfig} />
+
       <IndicatorSettings indicators={indicators} onChange={onChangeIndicators} />
+
+      <div style={{ padding:'5px 8px', borderBottom:'1px solid #222' }}>
+        <div style={{ fontSize:10, color:'#ffcc00', marginBottom:3 }}>테마</div>
+        <div style={{ display:'flex', gap:6 }}>
+          <select value={selectedThemeName}
+            onChange={e => onSelectTheme(e.target.value)}
+            style={{ flex:1, background:'#1a1500', color:'#ffcc00', border:'1px solid #665500', fontSize:10, padding:'2px 4px' }}>
+            {themes.map(theme => <option key={theme.name} value={theme.name}>{theme.name}</option>)}
+          </select>
+          <button onClick={onOpenThemeManager} style={{ fontSize:9, padding:'2px 8px', cursor:'pointer', borderRadius:4, background:'#111827', color:'#cbd5e1', border:'1px solid #334155' }}>관리</button>
+        </div>
+      </div>
 
       <div style={{ padding:'5px 8px', borderBottom:'1px solid #222' }}>
         <div style={{ fontSize:10, color:'#ffcc00', marginBottom:3 }}>포커스 [{focusedIdx+1}번] 종목</div>
@@ -744,25 +1229,84 @@ function SidePanel({ state, panels, focusedIdx, onChangeFocused, onChangePanel, 
         }
       </div>
 
+      <div style={{ padding:'4px 8px', borderBottom:'1px solid #222' }}>
+        <div style={{ fontSize:10, color:'#666', marginBottom:2 }}>포커스 포지션</div>
+        {!focusOverlay ? <div style={{ fontSize:9, color:'#444' }}>보유 없음</div> : (
+          <div style={{ fontSize:9, lineHeight:1.7, color:'#ccc' }}>
+            <div>평균단가 {focusOverlay.avg_price?.toLocaleString()} / 현재가 {focusOverlay.current_price?.toLocaleString()}</div>
+            <div>목표가 <span style={{ color:'#0c6' }}>{focusOverlay.target?.toLocaleString() || '-'}</span> / ATR목표 <span style={{ color:'#5eead4' }}>{focusOverlay.atr_target?.toLocaleString() || '-'}</span></div>
+            <div>손절가 <span style={{ color:'#f66' }}>{focusOverlay.stop?.toLocaleString() || '-'}</span> / ATR손절 <span style={{ color:'#facc15' }}>{focusOverlay.atr_stop?.toLocaleString() || '-'}</span></div>
+            <div>ATR {focusOverlay.atr ?? '-'} {focusOverlay.is_stale ? <span style={{ color:'#f66' }}>/ 실시간 지연 {focusOverlay.stale_seconds}s</span> : null}</div>
+            <div>평가손익 <span style={{ color: focusOverlay.pnl >= 0 ? '#f66' : '#69f' }}>{focusOverlay.pnl >= 0 ? '+' : ''}{focusOverlay.pnl?.toLocaleString()}원 ({focusOverlay.pnl_pct >= 0 ? '+' : ''}{focusOverlay.pnl_pct?.toFixed(2)}%)</span></div>
+          </div>
+        )}
+      </div>
+
+      <div style={{ padding:'4px 8px', borderBottom:'1px solid #222' }}>
+        <div style={{ fontSize:10, color:'#666', marginBottom:2 }}>호가분석</div>
+        {!focusHoga ? <div style={{ fontSize:9, color:'#444' }}>수신 없음</div> : (
+          <div style={{ fontSize:9, lineHeight:1.7, color:'#ccc' }}>
+            <div>압력 <span style={{ color: focusHoga.pressure === '매수우위' ? '#0c6' : focusHoga.pressure === '매도우위' ? '#f66' : '#aaa' }}>{focusHoga.pressure}</span> / 비율 {focusHoga.imbalance ?? '-'}</div>
+            <div>매수잔량 {focusHoga.bid_total?.toLocaleString?.() ?? focusHoga.bid_total} / 매도잔량 {focusHoga.ask_total?.toLocaleString?.() ?? focusHoga.ask_total}</div>
+            <div>최우선 매수 {focusHoga.best_bid?.toLocaleString?.() ?? focusHoga.best_bid} / 매도 {focusHoga.best_ask?.toLocaleString?.() ?? focusHoga.best_ask} / 스프레드 {focusHoga.spread?.toLocaleString?.() ?? focusHoga.spread}</div>
+          </div>
+        )}
+      </div>
+
       <div style={{ flex:1, overflow:'auto', padding:'4px 8px' }}>
-        <div style={{ display:'flex', alignItems:'center', gap:4, marginBottom:4 }}>
-          <span style={{ fontSize:10, color:'#666' }}>시그널</span>
-          {['ALL','BUY','SELL','HOLD'].map(f => (
-            <button key={f} onClick={() => setSigFilter(f)} style={{
-              fontSize:8, padding:'1px 4px', cursor:'pointer', borderRadius:2,
-              background: f === sigFilter ? (f==='BUY'?'#003300':f==='SELL'?'#330000':f==='HOLD'?'#222':'#002244') : '#111',
-              color: f === sigFilter ? (f==='BUY'?'#0c6':f==='SELL'?'#f44':f==='HOLD'?'#888':'#66aaff') : '#555',
-              border: `1px solid ${f === sigFilter ? '#444' : '#333'}`,
-            }}>{f}</button>
+        <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:6, padding:'6px 8px', background:'#111827', border:'1px solid #1f2937', borderRadius:8 }}>
+          {[
+            { id:'trades', label:'주문/체결' },
+            { id:'signals', label:'시그널' },
+          ].map(tab => (
+            <button key={tab.id} onClick={() => setActivityTab(tab.id)} style={{
+              flex:1, fontSize:10, padding:'6px 0', cursor:'pointer', borderRadius:6,
+              background: activityTab === tab.id ? '#082f49' : '#0b1220',
+              color: activityTab === tab.id ? '#7dd3fc' : '#64748b',
+              border: `1px solid ${activityTab === tab.id ? '#0ea5e9' : '#1f2937'}`,
+              fontWeight: activityTab === tab.id ? 'bold' : 'normal',
+            }}>{tab.label}</button>
           ))}
         </div>
-        {filteredSignals.slice(0,100).map((s,i) => (
-          <div key={i} style={{ fontSize:8, color:'#aaa', lineHeight:1.5 }}>
-            <span style={{ color:'#666' }}>{s.ts || '--:--:--'}</span>{' '}
-            <span style={{ color: actionColor[s.action] || '#888' }}>[{s.action}]</span>{' '}
-            {s.name} {s.price?.toLocaleString()} × {s.qty} — {s.reason}
-          </div>
-        ))}
+        {activityTab === 'signals' && (
+          <>
+            <div style={{ display:'flex', alignItems:'center', gap:4, marginBottom:4 }}>
+              {['ALL','BUY','SELL','HOLD'].map(f => (
+                <button key={f} onClick={() => setSigFilter(f)} style={{
+                  fontSize:8, padding:'1px 4px', cursor:'pointer', borderRadius:2,
+                  background: f === sigFilter ? (f==='BUY'?'#003300':f==='SELL'?'#330000':f==='HOLD'?'#222':'#002244') : '#111',
+                  color: f === sigFilter ? (f==='BUY'?'#0c6':f==='SELL'?'#f44':f==='HOLD'?'#888':'#66aaff') : '#555',
+                  border: `1px solid ${f === sigFilter ? '#444' : '#333'}`,
+                }}>{f}</button>
+              ))}
+            </div>
+            {filteredSignals.slice(0,100).map((s,i) => (
+              <div key={i} style={{ fontSize:8, color:'#aaa', lineHeight:1.5 }}>
+                <span style={{ color:'#666' }}>{s.ts || '--:--:--'}</span>{' '}
+                <span style={{ color: actionColor[s.action] || '#888' }}>[{s.action}]</span>{' '}
+                {s.name} {s.price?.toLocaleString()} × {s.qty} — {s.reason}
+              </div>
+            ))}
+          </>
+        )}
+        {activityTab === 'trades' && (
+          <>
+            <div style={{ fontSize:8, color:'#666', marginBottom:4 }}>파일 저장: `trade_logs/trades_YYYYMMDD.jsonl`</div>
+            {tradeLogs.slice(0,150).map((t, i) => (
+              <div key={i} style={{ fontSize:8, color:'#aaa', lineHeight:1.55, borderBottom:'1px solid #151515', paddingBottom:3, marginBottom:3 }}>
+                <div>
+                  <span style={{ color:'#666' }}>{t.ts || '--:--:--'}</span>{' '}
+                  <span style={{ color: t.action === 'BUY' ? '#0c6' : t.action === 'SELL' ? '#f44' : '#66aaff' }}>[{t.action || t.kind}]</span>{' '}
+                  <span style={{ color:'#e5e7eb' }}>{t.name || t.code}</span>{' '}
+                  {t.qty ? `${Number(t.qty).toLocaleString()}주` : ''} {t.price ? `@ ${Number(t.price).toLocaleString()}` : ''}
+                </div>
+                <div style={{ color:'#888' }}>{t.source} / {t.kind} / {t.status || '-'}</div>
+                {t.reason ? <div>{t.reason}</div> : null}
+                {t.message ? <div style={{ color:'#777' }}>{t.message}</div> : null}
+              </div>
+            ))}
+          </>
+        )}
       </div>
     </div>
   )
@@ -775,15 +1319,20 @@ function SidePanel({ state, panels, focusedIdx, onChangeFocused, onChangePanel, 
 export default function TradingDashboard() {
   const [state, setState] = useState(null)
   const [connected, setConnected] = useState(false)
+  const [lastError, setLastError] = useState('')
   const [layoutIdx, setLayoutIdx] = useState(2)
   const [panels, setPanels] = useState(makePanels(DEFAULT_CODES))
+  const [themes, setThemes] = useState(DEFAULT_THEMES)
+  const [selectedThemeName, setSelectedThemeName] = useState('IranWar')
+  const [themeDialogOpen, setThemeDialogOpen] = useState(false)
   const [focusedIdx, setFocusedIdx] = useState(0)
+  const [buyConfirm, setBuyConfirm] = useState(null)
   const [sellConfirm, setSellConfirm] = useState(null)
   const [tf, setTF] = useState('m1')
   const [candleCache, setCandleCache] = useState({})
   const [indicators, setIndicators] = useState({
     supertrend: { enabled: true, period: 10, multiplier: 3 },
-    jma: { enabled: false, period: 7, phase: 50, power: 2 },
+    jma: { enabled: true, period: 7, phase: 50, power: 2 },
     rsi: { enabled: true, period: 14 },
   })
   const ws = useRef(null)
@@ -824,23 +1373,81 @@ export default function TradingDashboard() {
   const layout = LAYOUTS[layoutIdx]
   const visibleCount = layout.cols * layout.rows
 
+  const applyTheme = useCallback((themeName, themeList = themes) => {
+    const nextThemes = normalizeThemes(themeList)
+    const theme = nextThemes.find(item => item.name === themeName) || nextThemes[0]
+    setThemes(nextThemes)
+    setSelectedThemeName(theme.name)
+    setPanels(makePanels(theme.codes))
+    setFocusedIdx(0)
+  }, [themes])
+
+  const loadThemes = useCallback(async () => {
+    try {
+      const resp = await fetch('/api/themes')
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+      const json = await resp.json()
+      const nextThemes = normalizeThemes(json.themes)
+      setThemes(nextThemes)
+      setSelectedThemeName(prev => nextThemes.some(theme => theme.name === prev) ? prev : nextThemes[0].name)
+      return nextThemes
+    } catch (err) {
+      console.error('theme load failed:', err)
+      return DEFAULT_THEMES
+    }
+  }, [])
+
+  useEffect(() => {
+    loadThemes().then(nextThemes => {
+      const normalized = normalizeThemes(nextThemes)
+      const active = normalized.find(theme => theme.name === selectedThemeName) || normalized[0]
+      setPanels(makePanels(active.codes))
+    })
+  }, [loadThemes])
+
+  const fetchCandlesForTF = useCallback(async (targetTF, codes) => {
+    const codeList = [...new Set((codes || []).filter(Boolean))]
+    if (targetTF === 'm1' || codeList.length === 0) return
+    const resp = await fetch(`/api/candles_batch?codes=${codeList.join(',')}&tf=${targetTF}`)
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    const json = await resp.json()
+    if (json.candles && typeof json.candles === 'object') {
+      setCandleCache(prev => ({
+        ...prev,
+        [targetTF]: {
+          ...(prev[targetTF] || {}),
+          ...json.candles,
+        },
+      }))
+    }
+  }, [])
+
   // fetch 완료 후 setTF → 차트 렌더 시 candleData 항상 존재 (빈 차트 방지)
   const handleChangeTF = useCallback(async (newTF) => {
     if (newTF === tf) return
     if (newTF === 'm1') { setCandleCache({}); setTF('m1'); return }
-    const codes = panels.slice(0, visibleCount).map(p => p.code).join(',')
     try {
-      const resp = await fetch(`/api/candles_batch?codes=${codes}&tf=${newTF}`)
-      if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-      const json = await resp.json()
-      if (json.candles && typeof json.candles === 'object') {
-        setCandleCache({ [newTF]: json.candles })
-        setTF(newTF)
-      }
+      const codes = panels.slice(0, visibleCount).map(p => p.code)
+      await fetchCandlesForTF(newTF, codes)
+      setTF(newTF)
     } catch(e) {
       console.error('TF 전환 실패:', e)
     }
-  }, [tf, panels, visibleCount])
+  }, [tf, panels, visibleCount, fetchCandlesForTF])
+
+  useEffect(() => {
+    if (tf === 'm1') return
+    const visibleCodes = panels.slice(0, visibleCount).map(p => p.code)
+    const cached = candleCache[tf] || {}
+    const missingCodes = visibleCodes.filter(code => cached[code] == null)
+    if (missingCodes.length === 0) return
+
+    let cancelled = false
+    fetchCandlesForTF(tf, missingCodes).catch(err => {
+      if (!cancelled) console.error('추가 패널 캔들 로드 실패:', err)
+    })
+    return () => { cancelled = true }
+  }, [tf, panels, visibleCount, candleCache, fetchCandlesForTF])
 
   // WebSocket
   useEffect(() => {
@@ -876,8 +1483,16 @@ export default function TradingDashboard() {
               daily_pnl: msg.daily_pnl ?? prev.daily_pnl,
               holdings: msg.holdings ?? prev.holdings,
               signals: msg.signals ?? prev.signals,
+              trade_logs: msg.trade_logs ?? prev.trade_logs,
+              buy_levels: msg.buy_levels ?? prev.buy_levels,
+              prev_closes: msg.prev_closes ?? prev.prev_closes,
+              position_overlays: msg.position_overlays ?? prev.position_overlays,
+              hoga_analysis: msg.hoga_analysis ?? prev.hoga_analysis,
+              data_health: msg.data_health ?? prev.data_health,
+              data_readiness: msg.data_readiness ?? prev.data_readiness,
               kospi: msg.kospi ?? prev.kospi,
               auto_trading: msg.auto_trading ?? prev.auto_trading,
+              trade_config: msg.trade_config ?? prev.trade_config,
               pnl_history: msg.pnl_history ?? prev.pnl_history,
             }
             const nc = next.signals?.length || 0
@@ -887,6 +1502,76 @@ export default function TradingDashboard() {
             }
             prevSignalCountRef.current = nc
             return next
+          })
+        }
+        if (msg.type === 'config_changed') {
+          setState(prev => {
+            if (!prev) return prev
+            return {
+              ...prev,
+              auto_trading: msg.auto_trading ?? prev.auto_trading,
+              regime: msg.regime ?? msg.regime_override ?? prev.regime,
+              trade_config: msg.trade_config ?? prev.trade_config,
+              data_health: msg.data_health ?? prev.data_health,
+              data_readiness: msg.data_readiness ?? prev.data_readiness,
+            }
+          })
+        }
+        if (msg.type === 'error') {
+          setLastError(msg.msg || '알 수 없는 오류')
+          setState(prev => {
+            if (!prev) return prev
+            return {
+              ...prev,
+              trade_logs: [{
+                ts: new Date().toISOString(),
+                kind: 'error',
+                source: 'server',
+                action: '',
+                code: '',
+                name: '주문오류',
+                qty: 0,
+                price: 0,
+                status: 'error',
+                message: msg.msg || '알 수 없는 오류',
+                reason: '오류 차단',
+              }, ...(prev.trade_logs || [])].slice(0, 200),
+            }
+          })
+        }
+        if (msg.type === 'order_result') {
+          const resultOk = msg.result?.Success ?? msg.result?.success ?? false
+          const action = msg.cmd?.includes('sell') ? 'SELL' : 'BUY'
+          const name = STOCK_NAMES[msg.code] || msg.code || '주문'
+          setState(prev => {
+            if (!prev) return prev
+            const manualLog = {
+              code: msg.code,
+              ts: msg.ts ? new Date(msg.ts).toLocaleTimeString('ko-KR', { hour12: false }) : '--:--:--',
+              action,
+              name,
+              price: msg.price,
+              qty: msg.qty,
+              marker_time: Math.floor(Date.now() / 1000 / 60) * 60,
+              reason: resultOk ? `수동 ${action === 'BUY' ? '매수' : '매도'} 주문 접수` : `주문 실패: ${msg.result?.Msg || msg.result?.message || '응답 확인 필요'}`,
+            }
+            return {
+              ...prev,
+              signals: [manualLog, ...(prev.signals || [])].slice(0, 200),
+              trade_logs: [{
+                ts: msg.ts || new Date().toISOString(),
+                kind: 'order_submit',
+                source: 'manual',
+                action,
+                code: msg.code,
+                name,
+                qty: msg.qty,
+                price: msg.price,
+                status: resultOk ? 'accepted' : 'failed',
+                message: resultOk ? '수동 주문 접수' : (msg.result?.Msg || msg.result?.message || '응답 확인 필요'),
+                reason: `수동 ${action === 'BUY' ? '매수' : '매도'} 주문`,
+              }, ...(prev.trade_logs || [])].slice(0, 200),
+            }
           })
         }
       }
@@ -917,13 +1602,58 @@ export default function TradingDashboard() {
   const send = useCallback((payload) => {
     if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify(payload))
   }, [])
+  const autoTradeBlockedReason = state?.data_health?.status !== 'ok'
+    ? state?.data_health?.reason
+    : (state?.data_readiness?.ready === false ? state?.data_readiness?.reason : '')
+  const toggleAutoQuick = useCallback(() => {
+    if (!(state?.auto_trading ?? false) && autoTradeBlockedReason) {
+      setLastError(`자동매매 차단: ${autoTradeBlockedReason}`)
+      return
+    }
+    const enabled = !(state?.auto_trading ?? false)
+    send({ cmd: 'toggle_auto', enabled })
+  }, [autoTradeBlockedReason, send, state])
+
+  const applyTradeConfig = useCallback((payload) => {
+    setState(prev => {
+      if (!prev) return prev
+      return {
+        ...prev,
+        trade_config: {
+          total_budget: payload.total_budget,
+          per_stock: payload.per_stock,
+          strategies: payload.strategies,
+        },
+      }
+    })
+    send({ cmd: 'set_config', ...payload })
+  }, [send])
+
+  const handleToggleIndicator = useCallback((key, enabled) => {
+    setIndicators(prev => ({ ...prev, [key]: { ...prev[key], enabled } }))
+  }, [])
 
   const handleBuy = useCallback((code, price) => {
     if (!price || price <= 0) return
-    const qty = calcQty(code, price)
-    send({ cmd: 'buy', code, qty, price })
+    const budget = state?.trade_config?.per_stock ?? 5000000
+    const qty = calcQty(code, price, budget)
+    const holding = (state?.holdings || []).find(h => h.code === code)
+    setBuyConfirm({
+      code,
+      name: STOCK_NAMES[code] || code,
+      price,
+      qty,
+      holdingQty: holding?.qty ?? 0,
+      holdingAvg: holding?.avg_price ?? 0,
+    })
+  }, [state])
+
+  const confirmBuy = useCallback(() => {
+    if (!buyConfirm) return
+    send({ cmd: 'buy', code: buyConfirm.code, qty: buyConfirm.qty, price: buyConfirm.price })
     playBeep('buy')
-  }, [send])
+    setBuyConfirm(null)
+  }, [buyConfirm, send])
 
   const handleSell = useCallback((code, name) => {
     setSellConfirm({ code, name })
@@ -941,6 +1671,38 @@ export default function TradingDashboard() {
       i === idx ? { code: newCode, title: newCode === 'KOSPI' ? 'KOSPI 지수' : (STOCK_NAMES[newCode] || newCode) } : p
     ))
   }, [])
+
+  const handleSelectTheme = useCallback((themeName) => {
+    applyTheme(themeName)
+  }, [applyTheme])
+
+  const handleSaveTheme = useCallback(async (originalName, payload) => {
+    const method = originalName ? 'PUT' : 'POST'
+    const url = originalName ? `/api/themes/${encodeURIComponent(originalName)}` : '/api/themes'
+    const resp = await fetch(url, {
+      method,
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const json = await resp.json()
+    if (!resp.ok || json.success === false) {
+      throw new Error(json.error || `HTTP ${resp.status}`)
+    }
+    const nextThemes = normalizeThemes(json.themes)
+    applyTheme(payload.name, nextThemes)
+    setThemeDialogOpen(false)
+  }, [applyTheme])
+
+  const handleDeleteTheme = useCallback(async (themeName) => {
+    const resp = await fetch(`/api/themes/${encodeURIComponent(themeName)}`, { method: 'DELETE' })
+    const json = await resp.json()
+    if (!resp.ok || json.success === false) {
+      throw new Error(json.error || `HTTP ${resp.status}`)
+    }
+    const nextThemes = normalizeThemes(json.themes)
+    applyTheme(nextThemes[0]?.name || 'IranWar', nextThemes)
+    setThemeDialogOpen(false)
+  }, [applyTheme])
 
   const currentPanels = panels.slice(0, visibleCount)
 
@@ -961,15 +1723,18 @@ export default function TradingDashboard() {
             }}>{l.id}</button>
           ))}
         </div>
+        <AutoTradeGateButton autoOn={state?.auto_trading ?? false} onToggle={toggleAutoQuick} blockedReason={autoTradeBlockedReason} />
         <button onClick={() => setCrosshairSync(v => !v)} title="크로스헤어 동기화 ON/OFF" style={{
           marginLeft:8, fontSize:9, padding:'1px 6px', cursor:'pointer', borderRadius:2,
           background: crosshairSync ? '#002244' : '#111',
           color: crosshairSync ? '#66aaff' : '#555',
           border: `1px solid ${crosshairSync ? '#224488' : '#333'}`,
         }}>⊕{crosshairSync ? 'SYNC' : 'FREE'}</button>
+        {lastError ? <span style={{ marginLeft:8, fontSize:10, color:'#f87171' }}>{lastError}</span> : null}
       </div>
 
       <MacroBar state={state} />
+      <DataHealthBanner health={state?.data_health} readiness={state?.data_readiness} />
       <WhipsawBanner status={state?.whipsaw_status} phase={state?.phase} />
 
       <div style={{ display:'flex', flex:1, overflow:'hidden', minHeight:0 }}>
@@ -982,22 +1747,44 @@ export default function TradingDashboard() {
         }}>
           {currentPanels.map((p, idx) => {
             const candleData = tf !== 'm1' ? (candleCache[tf]?.[p.code] ?? null) : null
+            const positionOverlay = state?.position_overlays?.[p.code] ?? null
+            const signalMarkers = (state?.signals || [])
+              .filter(s => s.code === p.code && (s.action === 'BUY' || s.action === 'SELL'))
+              .slice(0, 20)
+              .map(s => ({
+                time: s.marker_time || positionOverlay?.marker_time || Math.floor(Date.now() / 1000 / 60) * 60,
+                position: s.action === 'BUY' ? 'belowBar' : 'aboveBar',
+                color: s.action === 'BUY' ? '#00cc66' : '#ff4444',
+                shape: s.action === 'BUY' ? 'arrowUp' : 'arrowDown',
+                text: `${s.action} ${s.qty || ''}`.trim(),
+              }))
             return (
               <RealtimeChart
                 key={`${p.code}-${idx}`}
                 chartKey={`${p.code}-${idx}`}
                 code={p.code}
                 title={p.title}
-                price={p.code === 'KOSPI' ? state?.kospi : state?.prices?.[p.code]}
-                prevPrice={PREV_CLOSE[p.code] || (p.code === 'KOSPI' ? (window.__KOSPI_PREV || 5380) : 0)}
+                price={p.code === 'KOSPI'
+                  ? state?.kospi
+                  : ((positionOverlay?.current_price && positionOverlay.current_price > 0)
+                      ? positionOverlay.current_price
+                      : ((state?.prices?.[p.code] && state.prices[p.code] > 0)
+                          ? state.prices[p.code]
+                          : positionOverlay?.current_price))}
+                prevPrice={(state?.prev_closes?.[p.code] && state.prev_closes[p.code] > 0)
+                  ? state.prev_closes[p.code]
+                  : (PREV_CLOSE[p.code] || (p.code === 'KOSPI' ? (window.__KOSPI_PREV || 5380) : 0))}
                 whipsaw={state?.whipsaw_status?.[p.code]}
                 buyLevels={state?.buy_levels?.[p.code] ?? window.__BUY_LEVELS?.[p.code]}
+                positionOverlay={positionOverlay}
+                signalMarkers={signalMarkers}
                 focused={idx === focusedIdx}
                 onFocus={() => setFocusedIdx(idx)}
                 onBuy={() => handleBuy(p.code, p.code === 'KOSPI' ? state?.kospi : state?.prices?.[p.code])}
                 onSell={() => handleSell(p.code, p.title)}
                 tf={tf}
                 indicators={indicators}
+                onToggleIndicator={handleToggleIndicator}
                 candleData={candleData}
                 onChartReady={registerChart}
                 onChartDestroy={unregisterChart}
@@ -1012,12 +1799,39 @@ export default function TradingDashboard() {
           focusedIdx={focusedIdx}
           onChangeFocused={setFocusedIdx}
           onChangePanel={handleChangePanel}
+          themes={themes}
+          selectedThemeName={selectedThemeName}
+          onSelectTheme={handleSelectTheme}
+          onOpenThemeManager={() => setThemeDialogOpen(true)}
           tf={tf}
           onChangeTF={handleChangeTF}
           indicators={indicators}
           onChangeIndicators={setIndicators}
+          onSend={send}
+          onApplyConfig={applyTradeConfig}
         />
       </div>
+
+      {themeDialogOpen && (
+        <ThemeManagerDialog
+          themes={themes}
+          onClose={() => setThemeDialogOpen(false)}
+          onSave={async (originalName, payload) => {
+            try {
+              await handleSaveTheme(originalName, payload)
+            } catch (err) {
+              setLastError(err.message || '테마 저장 실패')
+            }
+          }}
+          onDelete={async (themeName) => {
+            try {
+              await handleDeleteTheme(themeName)
+            } catch (err) {
+              setLastError(err.message || '테마 삭제 실패')
+            }
+          }}
+        />
+      )}
 
       {sellConfirm && (
         <SellConfirmDialog
@@ -1025,6 +1839,13 @@ export default function TradingDashboard() {
           name={sellConfirm.name}
           onConfirm={confirmSell}
           onCancel={() => setSellConfirm(null)}
+        />
+      )}
+      {buyConfirm && (
+        <BuyConfirmDialog
+          order={buyConfirm}
+          onConfirm={confirmBuy}
+          onCancel={() => setBuyConfirm(null)}
         />
       )}
     </div>

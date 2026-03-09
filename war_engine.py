@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """
 =============================================================================
  WAR-ADAPTIVE MULTI-CHART TRADING ENGINE v1.0
@@ -15,6 +15,7 @@ import requests
 import json
 import time
 import threading
+from pathlib import Path
 import websocket
 import mysql.connector
 import pandas as pd
@@ -63,6 +64,71 @@ MYSQL_CONFIG = {
 
 DB_STOCK_INFO = os.getenv('DB_STOCK_INFO', 'stock_information')
 DB_CANDLES    = os.getenv('DB_CANDLES', 'stock_info')
+
+
+def _update_web_tick_state(code: str, price: int, volume: int = 0):
+    """실시간 틱을 웹 대시보드 상태에 즉시 반영한다."""
+    if not WEB_ENABLED or not code or price <= 0:
+        return
+
+    prices = engine_state.setdefault("prices", {})
+    prices[code] = price
+    if code == 'KOSPI':
+        engine_state["kospi"] = price
+
+    now_ts = int(time.time())
+    bar_time = now_ts - (now_ts % 60)
+    candle_hist = engine_state.setdefault("candle_history", {})
+    bars = candle_hist.setdefault(code, [])
+    tick_volume = max(1, int(volume or 0))
+
+    if bars and bars[-1]["time"] == bar_time:
+        bar = bars[-1]
+        bar["high"] = max(bar["high"], price)
+        bar["low"] = min(bar["low"], price)
+        bar["close"] = price
+        bar["volume"] = bar.get("volume", 0) + tick_volume
+    else:
+        bars.append({
+            "time": bar_time,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+            "volume": tick_volume,
+        })
+        if len(bars) > 600:
+            candle_hist[code] = bars[-600:]
+
+
+def _merge_lw_candles(history: list, live: list) -> list:
+    merged = {}
+    for candle in history or []:
+        merged[candle["time"]] = dict(candle)
+    for candle in live or []:
+        merged[candle["time"]] = dict(candle)
+    result = list(merged.values())
+    result.sort(key=lambda item: item["time"])
+    return result
+
+
+def _bar_time_from_timestamp(ts: str | None = None) -> int:
+    try:
+        dt = datetime.fromisoformat(str(ts)) if ts else datetime.now()
+    except Exception:
+        dt = datetime.now()
+    value = int(dt.timestamp())
+    return value - (value % 60)
+
+
+def _parse_int(value, default: int = 0) -> int:
+    try:
+        text = str(value).replace(',', '').strip()
+        if text == '':
+            return default
+        return int(float(text))
+    except Exception:
+        return default
 
 # ═══════════════════════════════════════════════════════════════
 # DATA CLASSES
@@ -185,6 +251,10 @@ class Server32Client:
         self._consecutive_failures = 0
         self._max_failures = 5
         self._backoff_until: Optional[datetime] = None
+        self._last_balance: list = []
+        self._last_balance_at: Optional[datetime] = None
+        self._last_dashboard: dict = {}
+        self._last_dashboard_at: Optional[datetime] = None
 
     def _check_backoff(self) -> bool:
         """backoff 기간 중이면 True 반환 (호출 차단)"""
@@ -253,11 +323,33 @@ class Server32Client:
     # ── 계좌 ──
     def get_dashboard(self, refresh=False) -> dict:
         path = '/api/dashboard/refresh' if refresh else '/api/dashboard'
-        return self._get(path)
+        res = self._get(path)
+        if res.get('Success') and res.get('Data') is not None:
+            self._last_dashboard = res
+            self._last_dashboard_at = datetime.now()
+            return res
+        return self._last_dashboard or res
 
     def get_balance(self) -> list:
+        # 직접 잔고를 우선 조회하되 실패 시 dashboard 캐시와 마지막 정상 잔고를 사용한다.
         res = self._get('/api/accounts/balance', {'accountNo': self.account_no})
-        return res.get('Data', []) if res['Success'] else []
+        if res['Success'] and isinstance(res.get('Data'), list):
+            self._last_balance = res.get('Data', [])
+            self._last_balance_at = datetime.now()
+            return self._last_balance
+
+        dash = self.get_dashboard(refresh=False)
+        dash_data = dash.get('Data', {}) if isinstance(dash, dict) else {}
+        dash_holdings = dash_data.get('Holdings') if isinstance(dash_data, dict) else None
+        if isinstance(dash_holdings, list):
+            self._last_balance = dash_holdings
+            self._last_balance_at = datetime.now()
+            return dash_holdings
+
+        if self._last_balance:
+            log.warning("⚠️ 잔고조회 실패 → 마지막 정상 잔고 캐시 사용")
+            return self._last_balance
+        return []
 
     def get_deposit(self) -> dict:
         res = self._get('/api/accounts/deposit', {'accountNo': self.account_no})
@@ -279,7 +371,9 @@ class Server32Client:
         return res.get('Data', []) if res['Success'] else []
 
     def get_minute_candles(self, code: str, tick: int = 1,
-                           stop_time: str = '20180101090000') -> list:
+                           stop_time: str = None) -> list:
+        if stop_time is None:
+            stop_time = (datetime.now() - timedelta(days=3)).strftime('%Y%m%d090000')
         res = self._get('/api/market/candles/minute', {
             'code': code, 'tick': str(tick), 'stopTime': stop_time
         })
@@ -347,7 +441,7 @@ class MySQLClient:
             SELECT code, name, market, sector, sector_large, market_cap,
                    per, pbr, eps, bps, div_yield, foreign_ratio
             FROM stock_base_info
-            WHERE code = %s AND is_excluded = 0
+            WHERE code = %s
         """, (code,))
         row = cur.fetchone()
         cur.close()
@@ -359,7 +453,6 @@ class MySQLClient:
             SELECT code, name, market_cap, per, foreign_ratio
             FROM stock_base_info
             WHERE (sector LIKE %s OR sector_large LIKE %s)
-              AND is_excluded = 0
             ORDER BY market_cap DESC
         """, (f'%{sector_keyword}%', f'%{sector_keyword}%'))
         rows = cur.fetchall()
@@ -860,10 +953,19 @@ class Chart2_DefenseScalp:
         self.ta = ta
         self.whipsaw = whipsaw
 
+    @staticmethod
+    def _cap_buy_quantity(raw_qty: int, current_price: int, per_stock_budget: int) -> int:
+        if current_price <= 0:
+            return 0
+        per_stock_qty = max(1, int(per_stock_budget / current_price))
+        return max(1, min(raw_qty, per_stock_qty))
+
     def generate_signal(self, code: str, minute_df: pd.DataFrame,
                         daily_df: pd.DataFrame, beta: float,
                         current_price: int, now: datetime = None,
-                        holding_qty: int = 0) -> Optional[Signal]:
+                        holding_qty: int = 0,
+                        total_budget: int = 100_000_000,
+                        per_stock_budget: int = 15_000_000) -> Optional[Signal]:
         target = TARGETS.get(code)
         if not target or target.sector != 'defense':
             return None
@@ -919,10 +1021,10 @@ class Chart2_DefenseScalp:
             ])
 
             if buy_score >= 3:
-                base_qty = max(1, int(100_000_000 * target.sector_weight *
+                base_qty = max(1, int(total_budget * target.sector_weight *
                                       SECTOR_ALLOCATION['defense'] * beta / current_price))
                 mult = self.whipsaw.size_multiplier(code, now)
-                qty  = max(1, int(base_qty * mult))
+                qty = self._cap_buy_quantity(max(1, int(base_qty * mult)), current_price, per_stock_budget)
                 return Signal(
                     code=code, name=target.name, action='BUY',
                     price=current_price, quantity=qty,
@@ -957,9 +1059,18 @@ class Chart3_EnergyOil:
     def __init__(self, ta: TechnicalAnalysis):
         self.ta = ta
 
+    @staticmethod
+    def _cap_buy_quantity(raw_qty: int, current_price: int, per_stock_budget: int) -> int:
+        if current_price <= 0:
+            return 0
+        per_stock_qty = max(1, int(per_stock_budget / current_price))
+        return max(1, min(raw_qty, per_stock_qty))
+
     def generate_signal(self, code: str, minute_df: pd.DataFrame,
                         wti: float, wti_change: float, beta: float,
-                        current_price: int, news_sent: str) -> Optional[Signal]:
+                        current_price: int, news_sent: str,
+                        total_budget: int = 100_000_000,
+                        per_stock_budget: int = 15_000_000) -> Optional[Signal]:
         target = TARGETS.get(code)
         if not target or target.sector != 'energy':
             return None
@@ -980,8 +1091,9 @@ class Chart3_EnergyOil:
             )
 
         if wti_change > 0.02 and rsi_val < 70:
-            qty = max(1, int(100_000_000 * target.sector_weight *
-                             SECTOR_ALLOCATION['energy'] * beta / max(current_price, 1)))
+            raw_qty = max(1, int(total_budget * target.sector_weight *
+                                 SECTOR_ALLOCATION['energy'] * beta / max(current_price, 1)))
+            qty = self._cap_buy_quantity(raw_qty, current_price, per_stock_budget)
             return Signal(
                 code=code, name=target.name, action='BUY',
                 price=current_price, quantity=qty,
@@ -1010,9 +1122,18 @@ class Chart4_SemiContrarian:
             '005930': set(), '000660': set()
         }
 
+    @staticmethod
+    def _cap_buy_quantity(raw_qty: int, current_price: int, per_stock_budget: int) -> int:
+        if current_price <= 0:
+            return 0
+        per_stock_qty = max(1, int(per_stock_budget / current_price))
+        return max(1, min(raw_qty, per_stock_qty))
+
     def generate_signals(self, code: str, daily_df: pd.DataFrame,
                          current_price: int, beta: float,
-                         war_day: int, nvidia_chg: float) -> List[Signal]:
+                         war_day: int, nvidia_chg: float,
+                         total_budget: int = 100_000_000,
+                         per_stock_budget: int = 15_000_000) -> List[Signal]:
         target = TARGETS.get(code)
         if not target or target.sector != 'semiconductor':
             return []
@@ -1037,7 +1158,8 @@ class Chart4_SemiContrarian:
 
                 size = (level['pct'] * target.sector_weight *
                         SECTOR_ALLOCATION['semiconductor'] * beta * war_mult * nv_boost)
-                qty = max(1, int(100_000_000 * size / max(current_price, 1)))
+                raw_qty = max(1, int(total_budget * size / max(current_price, 1)))
+                qty = self._cap_buy_quantity(raw_qty, current_price, per_stock_budget)
 
                 signals.append(Signal(
                     code=code, name=target.name, action='BUY',
@@ -1073,7 +1195,12 @@ class RealtimeHandler:
         self.on_tick = on_tick_callback
         self.ws = None
         self.prices: Dict[str, int] = {}
+        self.hoga: Dict[str, dict] = {}
+        self.last_tick_at: Dict[str, datetime] = {}
         self.minute_buffers: Dict[str, List[dict]] = {}
+        self.last_message_at: Optional[datetime] = None
+        self.connection_status: str = "disconnected"
+        self.last_error: str = ""
         self._running = False
 
     def start(self):
@@ -1090,6 +1217,7 @@ class RealtimeHandler:
         def on_message(ws, msg):
             try:
                 data = json.loads(msg)
+                self.last_message_at = datetime.now()
                 msg_type = data.get('type', '')
                 code = data.get('code', '')
 
@@ -1099,26 +1227,38 @@ class RealtimeHandler:
                     volume = int(str(tick.get('volume', '0')))
 
                     self.prices[code] = price
+                    self.last_tick_at[code] = datetime.now()
+                    _update_web_tick_state(code, price, volume)
                     self._update_minute_buffer(code, price, volume, tick)
                     self.on_tick(code, price, volume, tick)
+                elif msg_type == 'hoga' and code:
+                    self.hoga[code] = data.get('data', {}) or {}
 
             except Exception as e:
                 log.debug(f"WS parse error: {e}")
 
         def on_error(ws, error):
+            self.connection_status = "error"
+            self.last_error = str(error)
             log.warning(f"WS error: {error}")
 
         def on_close(ws, code, reason):
+            self.connection_status = "closed"
             log.info(f"WS closed: {code} {reason}")
             if self._running:
                 time.sleep(3)
                 self._connect()
+
+        def on_open(ws):
+            self.connection_status = "connected"
+            self.last_error = ""
 
         self.ws = websocket.WebSocketApp(
             WS_REALTIME,
             on_message=on_message,
             on_error=on_error,
             on_close=on_close,
+            on_open=on_open,
         )
         self.ws.run_forever()
 
@@ -1160,13 +1300,13 @@ class RealtimeHandler:
 
 class RiskManager:
 
-    MAX_SINGLE_POSITION = 0.15
     MAX_DAILY_LOSS = -0.06       # -0.05→-0.06 (전쟁 변동성 반영)
     MAX_DRAWDOWN = -0.15         # -0.12→-0.15
     MIN_CASH = 0.10
 
     def __init__(self, total_capital: int):
         self.total_capital = total_capital
+        self.per_stock_budget = total_capital
         self.daily_pnl = 0
         self.max_equity = total_capital
         self.realized_pnl = 0    # 실현 손익 (매도 체결 누적)
@@ -1223,10 +1363,11 @@ class RiskManager:
         return True
 
     def adjust_quantity(self, signal: Signal) -> int:
-        max_amount = self.total_capital * self.MAX_SINGLE_POSITION
         if signal.price > 0:
-            max_qty = int(max_amount / signal.price)
-            return min(signal.quantity, max_qty)
+            configured_qty = int(self.per_stock_budget / signal.price) if self.per_stock_budget > 0 else signal.quantity
+            if configured_qty <= 0:
+                return 0
+            return min(signal.quantity, configured_qty)
         return signal.quantity
 
 
@@ -1236,17 +1377,45 @@ class RiskManager:
 
 class OrderExecutor:
 
-    def __init__(self, api: Server32Client, risk: RiskManager):
+    def __init__(self, api: Server32Client, risk: RiskManager, event_recorder=None):
         self.api = api
         self.risk = risk
+        self.event_recorder = event_recorder
         self.pending_signals: List[Signal] = []
         self.executed_orders: List[dict] = []
+        self.order_cooldowns: Dict[str, datetime] = {}
+
+    def _cooldown_open(self, code: str, action: str, seconds: int = 10) -> bool:
+        key = f"{code}:{action}"
+        until = self.order_cooldowns.get(key)
+        if until and datetime.now() < until:
+            return True
+        self.order_cooldowns[key] = datetime.now() + timedelta(seconds=seconds)
+        return False
 
     def process_signal(self, signal: Signal, holdings: list):
         if signal.action == 'HOLD':
             return
 
         signal.timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        if self._cooldown_open(signal.code, signal.action):
+            if self.event_recorder:
+                self.event_recorder({
+                    "kind": "order_blocked",
+                    "source": "auto",
+                    "action": signal.action,
+                    "code": signal.code,
+                    "name": signal.name,
+                    "qty": signal.quantity,
+                    "price": signal.price,
+                    "chart": signal.chart,
+                    "reason": f"중복주문 쿨다운 차단: {signal.reason}",
+                    "status": "blocked",
+                    "signal_ts": signal.timestamp,
+                    "stop_loss": signal.stop_loss,
+                    "take_profit": signal.take_profit,
+                })
+            return
 
         if signal.action == 'BUY':
             if not self.risk.can_buy(signal, holdings):
@@ -1266,6 +1435,23 @@ class OrderExecutor:
                 price=signal.price,
                 quote_type='00',
             )
+            if self.event_recorder:
+                self.event_recorder({
+                    "kind": "order_submit",
+                    "source": "auto",
+                    "action": "BUY",
+                    "code": signal.code,
+                    "name": signal.name,
+                    "qty": qty,
+                    "price": signal.price,
+                    "chart": signal.chart,
+                    "reason": signal.reason,
+                    "status": "accepted" if result.get("Success") else "failed",
+                    "message": result.get("Message", ""),
+                    "signal_ts": signal.timestamp,
+                    "stop_loss": signal.stop_loss,
+                    "take_profit": signal.take_profit,
+                })
             self.executed_orders.append({
                 'signal': signal, 'result': result, 'time': signal.timestamp
             })
@@ -1294,6 +1480,23 @@ class OrderExecutor:
                 price=0,
                 quote_type='03',
             )
+            if self.event_recorder:
+                self.event_recorder({
+                    "kind": "order_submit",
+                    "source": "auto",
+                    "action": "SELL",
+                    "code": signal.code,
+                    "name": signal.name,
+                    "qty": sell_qty,
+                    "price": signal.price,
+                    "chart": signal.chart,
+                    "reason": signal.reason,
+                    "status": "accepted" if result.get("Success") else "failed",
+                    "message": result.get("Message", ""),
+                    "signal_ts": signal.timestamp,
+                    "stop_loss": signal.stop_loss,
+                    "take_profit": signal.take_profit,
+                })
 
             if result.get('Success') and avg_buy_price > 0:
                 self.risk.on_sell_executed(
@@ -1350,6 +1553,18 @@ class WarAdaptiveEngine:
     TOTAL_CAPITAL = 100_000_000  # 1억원
     CYCLE_INTERVAL = 60
     EXTERNAL_INTERVAL = 300
+    CENTRAL_HISTORY_MIN_BARS = 60
+    CENTRAL_HISTORY_REFRESH_SEC = 20
+    DEFAULT_TRADE_CONFIG = {
+        "total_budget": 5_000_000,
+        "per_stock": 1_000_000,
+        "strategies": {
+            "macro": True,
+            "defense": True,
+            "energy": True,
+            "semi": True,
+        },
+    }
 
     def __init__(self):
         log.info("=" * 60)
@@ -1361,7 +1576,8 @@ class WarAdaptiveEngine:
         self.ext = ExternalDataCollector()
         self.ta = TechnicalAnalysis()
         self.risk = RiskManager(self.TOTAL_CAPITAL)
-        self.executor = OrderExecutor(self.api, self.risk)
+        self.executor = OrderExecutor(self.api, self.risk, event_recorder=self.record_trade_event)
+        self.targets = TARGETS
 
         self.whipsaw = WhipsawDefenseEngine()
         self.chart1 = Chart1_MacroRegime()
@@ -1373,9 +1589,387 @@ class WarAdaptiveEngine:
         self.exec_handler = ExecutionHandler(on_execution_callback=self._on_execution)
 
         self._last_external_update = datetime.min
+        self._last_realtime_recover = datetime.min
         self._cycle_count = 0
         self._running = False
-        self.auto_trading_enabled = True
+        self.auto_trading_enabled = False
+        self.trade_log_dir = Path(__file__).resolve().parent / "trade_logs"
+        self.trade_log_dir.mkdir(exist_ok=True)
+        self._last_candle_sync_at: Dict[str, datetime] = {}
+        self._last_auto_disable_reason = ""
+        self.trade_config = {
+            "total_budget": self.DEFAULT_TRADE_CONFIG["total_budget"],
+            "per_stock": self.DEFAULT_TRADE_CONFIG["per_stock"],
+            "strategies": dict(self.DEFAULT_TRADE_CONFIG["strategies"]),
+        }
+
+    def record_trade_event(self, event: dict):
+        ts = event.get("ts") or datetime.now().isoformat()
+        payload = {
+            "ts": ts,
+            "kind": event.get("kind", "log"),
+            "source": event.get("source", "system"),
+            "action": event.get("action", ""),
+            "code": event.get("code", ""),
+            "name": event.get("name", ""),
+            "qty": int(event.get("qty", 0) or 0),
+            "price": _parse_int(event.get("price", 0), 0),
+            "chart": event.get("chart", ""),
+            "reason": event.get("reason", ""),
+            "status": event.get("status", ""),
+            "message": event.get("message", ""),
+            "signal_ts": event.get("signal_ts", ""),
+            "stop_loss": _parse_int(event.get("stop_loss", 0), 0),
+            "take_profit": _parse_int(event.get("take_profit", 0), 0),
+            "raw": event.get("raw"),
+        }
+        trade_logs = engine_state.get("trade_logs", [])
+        trade_logs.insert(0, payload)
+        engine_state["trade_logs"] = trade_logs[:500]
+
+        log_path = self.trade_log_dir / f"trades_{datetime.now().strftime('%Y%m%d')}.jsonl"
+        with log_path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(payload, ensure_ascii=False, default=str) + "\n")
+
+    def _get_trade_config(self) -> dict:
+        config = self.trade_config or {}
+        strategies = dict(self.DEFAULT_TRADE_CONFIG["strategies"])
+        strategies.update(config.get("strategies", {}))
+        return {
+            "total_budget": int(config.get("total_budget", self.DEFAULT_TRADE_CONFIG["total_budget"])),
+            "per_stock": int(config.get("per_stock", self.DEFAULT_TRADE_CONFIG["per_stock"])),
+            "strategies": {key: bool(value) for key, value in strategies.items()},
+        }
+
+    def _sync_risk_budget(self, total_budget: int, per_stock_budget: int):
+        if self.risk.total_capital == total_budget and self.risk.per_stock_budget == per_stock_budget:
+            return
+        self.risk.total_capital = total_budget
+        self.risk.per_stock_budget = per_stock_budget
+        self.risk.max_equity = max(self.risk.max_equity, total_budget + self.risk.daily_pnl)
+        log.info(f"⚙️ 실전 투자금 설정 반영: 총 {total_budget:,}원 / 종목당 {per_stock_budget:,}원")
+
+    def build_buy_levels_map(self) -> dict:
+        levels = {}
+        for code, target in self.targets.items():
+            row = {}
+            for item in target.buy_levels:
+                if item.get("label") and item.get("price"):
+                    row[item["label"]] = int(item["price"])
+            levels[code] = row
+        return levels
+
+    def build_prev_close_map(self) -> dict:
+        data = {}
+        for code, target in self.targets.items():
+            data[code] = int(getattr(target, "prev_close", 0) or 0)
+        return data
+
+    def refresh_prev_closes(self):
+        today = datetime.now().strftime('%Y%m%d')
+        stop = (datetime.now() - timedelta(days=10)).strftime('%Y%m%d')
+        for code, target in self.targets.items():
+            raw = self.api.get_daily_candles(code, today, stop)
+            if not raw:
+                continue
+            rows = [r for r in raw if str(r.get('일자', ''))]
+            if not rows:
+                continue
+            rows.sort(key=lambda r: str(r.get('일자', '')), reverse=True)
+            selected = None
+            if str(rows[0].get('일자', '')) == today and len(rows) > 1:
+                selected = rows[1]
+            else:
+                selected = rows[0]
+            prev_close = _parse_int(selected.get('현재가', 0), 0)
+            if prev_close > 0:
+                target.prev_close = prev_close
+
+    def build_hoga_analysis(self, code: str) -> dict:
+        raw = self.rt.hoga.get(code, {}) or {}
+        ask_total = int(raw.get('total_ask_vol', 0) or 0)
+        bid_total = int(raw.get('total_bid_vol', 0) or 0)
+        best_ask = int(raw.get('ask_price_1', 0) or 0)
+        best_bid = int(raw.get('bid_price_1', 0) or 0)
+        imbalance = round((bid_total / ask_total), 2) if ask_total > 0 else None
+        pressure = (
+            '매수우위' if imbalance is not None and imbalance >= 1.2 else
+            '매도우위' if imbalance is not None and imbalance <= 0.8 else
+            '중립'
+        )
+        return {
+            "best_ask": best_ask,
+            "best_bid": best_bid,
+            "spread": max(0, best_ask - best_bid) if best_ask and best_bid else 0,
+            "ask_total": ask_total,
+            "bid_total": bid_total,
+            "imbalance": imbalance,
+            "pressure": pressure,
+        }
+
+    def _minute_df_to_lw(self, df: pd.DataFrame) -> list:
+        if df is None or df.empty:
+            return []
+        candles = []
+        for _, row in df.sort_values("time").iterrows():
+            dt = row.get("time")
+            if pd.isna(dt):
+                continue
+            ts = int(pd.Timestamp(dt).timestamp())
+            candles.append({
+                "time": ts - (ts % 60),
+                "open": _parse_int(row.get("open", 0), 0),
+                "high": _parse_int(row.get("high", 0), 0),
+                "low": _parse_int(row.get("low", 0), 0),
+                "close": _parse_int(row.get("close", 0), 0),
+                "volume": _parse_int(row.get("volume", 0), 0),
+            })
+        return candles
+
+    def sync_central_candle_history(self, force: bool = False):
+        candle_hist = engine_state.setdefault("candle_history", {})
+        codes = ["KOSPI", *list(TARGETS.keys())]
+        stop_time = (datetime.now() - timedelta(days=3)).strftime("%Y%m%d090000")
+
+        for code in codes:
+            bars = candle_hist.get(code, [])
+            last_sync = self._last_candle_sync_at.get(code)
+            recently_synced = last_sync and (datetime.now() - last_sync).total_seconds() < self.CENTRAL_HISTORY_REFRESH_SEC
+            if not force and recently_synced and len(bars) >= self.CENTRAL_HISTORY_MIN_BARS:
+                continue
+
+            api_code = "U001" if code == "KOSPI" else code
+            raw = self.api.get_minute_candles(api_code, tick=1, stop_time=stop_time)
+            if not raw:
+                continue
+
+            parsed = self._parse_minute_candles(raw)
+            fetched = self._minute_df_to_lw(parsed)
+            if not fetched:
+                continue
+
+            candle_hist[code] = _merge_lw_candles(fetched, bars)[-600:]
+            self._last_candle_sync_at[code] = datetime.now()
+
+    def assess_data_readiness(self) -> dict:
+        candle_hist = engine_state.get("candle_history", {})
+        required_codes = list(TARGETS.keys())
+        ready_codes = []
+        loading_codes = []
+
+        for code in required_codes:
+            bars = candle_hist.get(code, [])
+            if len(bars) >= self.CENTRAL_HISTORY_MIN_BARS:
+                ready_codes.append(code)
+            else:
+                loading_codes.append(code)
+
+        ready = len(loading_codes) == 0
+        if ready:
+            status = "ready"
+            reason = "중앙 캔들 준비 완료"
+        elif ready_codes:
+            status = "loading"
+            names = [self.targets.get(code).name if code in self.targets else code for code in loading_codes[:3]]
+            reason = f"캔들 로딩중: {', '.join(names)}"
+        else:
+            status = "cold_start"
+            reason = "중앙 캔들 초기 수집중"
+
+        return {
+            "ready": ready,
+            "status": status,
+            "reason": reason,
+            "required_bars": self.CENTRAL_HISTORY_MIN_BARS,
+            "ready_count": len(ready_codes),
+            "required_count": len(required_codes),
+            "loading_codes": loading_codes[:6],
+        }
+
+    def _calc_recent_atr(self, code: str, period: int = 14) -> float:
+        min_df = self.rt.get_minute_df(code)
+        if len(min_df) < period + 2:
+            raw = self.api.get_minute_candles(code, tick=1)
+            if raw:
+                min_df = self._parse_minute_candles(raw)
+        if len(min_df) < period + 1:
+            return 0.0
+
+        high = min_df['high'].astype(float)
+        low = min_df['low'].astype(float)
+        close = min_df['close'].astype(float)
+        prev_close = close.shift(1)
+        tr = pd.concat([
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ], axis=1).max(axis=1)
+        atr = tr.rolling(period).mean().iloc[-1]
+        return float(atr) if pd.notna(atr) else 0.0
+
+    def generate_protective_signals(self, holdings: list) -> List[Signal]:
+        signals: List[Signal] = []
+        overlays = self.build_position_overlays(holdings)
+        now_ts = datetime.now().strftime('%Y%m%d%H%M%S')
+        for code, overlay in overlays.items():
+            current_price = int(overlay.get("current_price", 0) or 0)
+            atr_stop = int(overlay.get("atr_stop", 0) or 0)
+            hard_stop = int(overlay.get("stop", 0) or 0)
+            if current_price <= 0:
+                continue
+            trigger_price = max(atr_stop, hard_stop)
+            if trigger_price > 0 and current_price <= trigger_price:
+                signals.append(Signal(
+                    code=code,
+                    name=self.targets.get(code).name if code in self.targets else code,
+                    action='SELL',
+                    price=current_price,
+                    quantity=0,
+                    confidence=0.99,
+                    chart='RISK',
+                    reason=f'ATR 보호손절 발동 ({current_price:,} <= {trigger_price:,})',
+                    stop_loss=trigger_price,
+                    take_profit=int(overlay.get("atr_target", 0) or overlay.get("target", 0) or 0),
+                    timestamp=now_ts,
+                ))
+        return signals
+
+    def build_position_overlays(self, holdings: list) -> dict:
+        overlays = {}
+        for h in holdings:
+            code = h.get('종목코드', '').strip()
+            qty = _parse_int(h.get('보유수량', '0'), 0)
+            avg_price = _parse_int(h.get('매입단가', '0'), 0)
+            if not code or qty <= 0 or avg_price <= 0:
+                continue
+            balance_price = _parse_int(h.get('현재가', 0), 0)
+            current_price = balance_price or self.rt.prices.get(code, avg_price)
+            target = self.targets.get(code)
+            base_stop = int(avg_price * (1 + target.stop_loss_pct)) if target else 0
+            take_profit = int(target.target_price) if target else 0
+            atr = self._calc_recent_atr(code)
+            atr_stop = int(max(base_stop, max(avg_price, current_price) - atr * 2.2)) if atr > 0 else base_stop
+            atr_target = int(max(take_profit, avg_price + atr * 3.5)) if atr > 0 else take_profit
+            pnl = (current_price - avg_price) * qty
+            pnl_pct = round((current_price / avg_price - 1) * 100, 2) if avg_price > 0 else 0
+            last_tick_at = self.rt.last_tick_at.get(code)
+            stale_seconds = int((datetime.now() - last_tick_at).total_seconds()) if last_tick_at else None
+            overlays[code] = {
+                "qty": qty,
+                "avg_price": avg_price,
+                "current_price": current_price,
+                "pnl": pnl,
+                "pnl_pct": pnl_pct,
+                "stop": base_stop,
+                "target": take_profit,
+                "atr": round(atr, 2) if atr > 0 else 0,
+                "atr_stop": atr_stop,
+                "atr_target": atr_target,
+                "marker_time": _bar_time_from_timestamp(),
+                "stale_seconds": stale_seconds,
+                "is_stale": bool(stale_seconds is not None and stale_seconds > 15),
+                "hoga": self.build_hoga_analysis(code),
+            }
+        return overlays
+
+    def assess_data_health(self) -> dict:
+        codes = list(self.targets.keys())
+        now = datetime.now()
+        stale_codes = []
+        latest_tick_at = None
+        latest_bar_at = None
+        for code in codes:
+            tick_at = self.rt.last_tick_at.get(code)
+            if tick_at:
+                if latest_tick_at is None or tick_at > latest_tick_at:
+                    latest_tick_at = tick_at
+            else:
+                stale_codes.append(code)
+                continue
+            age = (now - tick_at).total_seconds()
+            if age > 15:
+                stale_codes.append(code)
+
+            buf = self.rt.minute_buffers.get(code, [])
+            if buf:
+                bar_time = buf[-1].get('time')
+                if isinstance(bar_time, datetime) and (latest_bar_at is None or bar_time > latest_bar_at):
+                    latest_bar_at = bar_time
+
+        stale_ratio = (len(stale_codes) / len(codes)) if codes else 0
+        status = "ok"
+        reason = "실시간 정상"
+        if self.rt.connection_status != "connected":
+            status = "critical"
+            reason = f"실시간 WS {self.rt.connection_status}"
+        elif stale_ratio >= 0.5:
+            status = "critical"
+            reason = f"틱 정지 {len(stale_codes)}/{len(codes)}종목"
+        elif stale_codes:
+            status = "warning"
+            reason = f"부분 지연 {len(stale_codes)}종목"
+
+        if latest_bar_at and (now - latest_bar_at).total_seconds() > 90:
+            status = "critical"
+            reason = "신규봉 생성 지연"
+
+        return {
+            "status": status,
+            "reason": reason,
+            "connection": self.rt.connection_status,
+            "last_error": self.rt.last_error,
+            "stale_codes": stale_codes[:6],
+            "stale_count": len(stale_codes),
+            "last_tick_at": latest_tick_at.isoformat() if latest_tick_at else None,
+            "last_bar_at": latest_bar_at.isoformat() if latest_bar_at else None,
+        }
+
+    def recover_realtime_if_needed(self, data_health: dict):
+        if data_health.get("status") != "critical":
+            return
+        if (datetime.now() - self._last_realtime_recover).total_seconds() < 20:
+            return
+
+        self._last_realtime_recover = datetime.now()
+        reason = data_health.get("reason", "unknown")
+        log.warning(f"🚨 실시간 비상복구 시도: {reason}")
+        self.record_trade_event({
+            "kind": "realtime_recover",
+            "source": "system",
+            "action": "",
+            "code": "",
+            "name": "실시간복구",
+            "qty": 0,
+            "price": 0,
+            "status": "retry",
+            "reason": reason,
+            "message": "WS 재연결 및 종목 재구독 시도",
+        })
+        try:
+            self.api.unsubscribe_realtime()
+        except Exception:
+            pass
+        try:
+            self.rt.stop()
+        except Exception:
+            pass
+        time.sleep(1)
+        self.rt.start()
+        time.sleep(1)
+        try:
+            self.api.subscribe_realtime(list(self.targets.keys()), screen='1000')
+            log.info("📡 실시간 재구독 완료")
+        except Exception as e:
+            log.warning(f"실시간 재구독 실패: {e}")
+
+    def refresh_web_state(self, all_signals: Optional[List[Signal]] = None, manual_signal: Optional[dict] = None) -> list:
+        holdings = self.api.get_balance()
+        if manual_signal:
+            manual_signals = engine_state.get("manual_signals", [])
+            manual_signals.insert(0, manual_signal)
+            engine_state["manual_signals"] = manual_signals[:100]
+        _update_web_state_v2(self, holdings, all_signals or [])
+        return holdings
 
     def initialize(self) -> bool:
         if not self.api.login():
@@ -1391,6 +1985,7 @@ class WarAdaptiveEngine:
         deposit = self.api.get_deposit()
         log.info(f"💰 계좌: {self.api.account_no}")
         log.info(f"💰 예수금: {deposit}")
+        self.refresh_prev_closes()
 
         for code, target in TARGETS.items():
             info = self.db.get_stock_info(code)
@@ -1404,6 +1999,7 @@ class WarAdaptiveEngine:
                     target.prev_close = int(sym.get('last_price', 0))
 
         self.ext.update_all()
+        self.sync_central_candle_history(force=True)
 
         self.rt.start()
         self.exec_handler.start()
@@ -1411,6 +2007,7 @@ class WarAdaptiveEngine:
 
         all_codes = list(TARGETS.keys())
         self.api.subscribe_realtime(all_codes, screen='1000')
+        self.sync_central_candle_history(force=True)
         log.info(f"📡 실시간 구독: {len(all_codes)}종목")
 
         # 요동장 엔진에 방산·에너지 종목 등록
@@ -1428,8 +2025,28 @@ class WarAdaptiveEngine:
 
     def _on_execution(self, data: dict):
         msg_type = data.get('type', '')
+        raw = data.get('data', {}) or {}
         if msg_type == 'order':
-            log.info(f"✅ 체결알림: {json.dumps(data.get('data', {}), ensure_ascii=False)[:200]}")
+            log.info(f"✅ 체결알림: {json.dumps(raw, ensure_ascii=False)[:200]}")
+            code = str(raw.get('종목코드', '') or raw.get('code', '')).strip()
+            target_name = self.targets.get(code).name if code in self.targets else ''
+            name = str(raw.get('종목명', '') or target_name or raw.get('name', '')).strip()
+            qty = _parse_int(raw.get('체결수량', raw.get('주문수량', 0)), 0)
+            price = _parse_int(raw.get('체결가', raw.get('주문가격', raw.get('현재가', 0))), 0)
+            side = str(raw.get('주문구분', raw.get('매매구분', ''))).upper()
+            action = 'SELL' if ('매도' in side or side.endswith('2')) else 'BUY' if ('매수' in side or side.endswith('1')) else ''
+            self.record_trade_event({
+                "kind": "execution",
+                "source": "execution_ws",
+                "action": action,
+                "code": code,
+                "name": name or code,
+                "qty": qty,
+                "price": price,
+                "status": "filled",
+                "message": str(raw.get('상태', raw.get('message', '체결알림'))),
+                "raw": raw,
+            })
 
     def run(self):
         self._running = True
@@ -1453,9 +2070,35 @@ class WarAdaptiveEngine:
                     foreign_net=self.ext.foreign_net_buy,
                     news_sent=self.ext.news_sentiment,
                 )
+                data_health = self.assess_data_health()
+                self.sync_central_candle_history()
+                data_readiness = self.assess_data_readiness()
+                self.recover_realtime_if_needed(data_health)
+                if self.auto_trading_enabled and (data_health["status"] != "ok" or not data_readiness["ready"]):
+                    block_reason = data_health["reason"] if data_health["status"] != "ok" else data_readiness["reason"]
+                    self.auto_trading_enabled = False
+                    if self._last_auto_disable_reason != block_reason:
+                        self.record_trade_event({
+                            "kind": "auto_disabled",
+                            "source": "system",
+                            "action": "",
+                            "code": "",
+                            "name": "자동매매중지",
+                            "qty": 0,
+                            "price": 0,
+                            "status": "forced_off",
+                            "reason": block_reason,
+                            "message": "데이터 이상 또는 캔들 미준비로 자동매매를 강제 중지했습니다.",
+                        })
+                        self._last_auto_disable_reason = block_reason
+                elif data_health["status"] == "ok" and data_readiness["ready"]:
+                    self._last_auto_disable_reason = ""
 
                 holdings = self.api.get_balance()
                 now = datetime.now()
+                trade_cfg = self._get_trade_config()
+                self.trade_config = trade_cfg
+                self._sync_risk_budget(trade_cfg["total_budget"], trade_cfg["per_stock"])
 
                 # 미실현 손익 갱신 (매 사이클)
                 self.risk.update_unrealized_pnl(holdings, self.rt.prices)
@@ -1466,6 +2109,7 @@ class WarAdaptiveEngine:
                     self.whipsaw.reset_daily()
 
                 all_signals: List[Signal] = []
+                all_signals.extend(self.generate_protective_signals(holdings))
 
                 for code, target in TARGETS.items():
                     price = self.rt.prices.get(code, target.prev_close)
@@ -1480,39 +2124,61 @@ class WarAdaptiveEngine:
 
                     daily_df = self.db.get_daily_candles_df(code, days=60)
 
-                    if target.sector == 'defense':
+                    if target.sector == 'defense' and trade_cfg["strategies"].get("defense", True):
                         held = next((int(h.get('보유수량', '0')) for h in holdings
                                      if h.get('종목코드', '').strip() == code), 0)
                         sig = self.chart2.generate_signal(
                             code, min_df, daily_df, beta, price,
                             now=now, holding_qty=held,
+                            total_budget=trade_cfg["total_budget"],
+                            per_stock_budget=trade_cfg["per_stock"],
                         )
                         if sig:
                             all_signals.append(sig)
 
-                    elif target.sector == 'energy':
+                    elif target.sector == 'energy' and trade_cfg["strategies"].get("energy", True):
                         sig = self.chart3.generate_signal(
                             code, min_df, self.ext.latest_wti,
                             self.ext.wti_change_pct, beta, price,
                             self.ext.news_sentiment,
+                            total_budget=trade_cfg["total_budget"],
+                            per_stock_budget=trade_cfg["per_stock"],
                         )
                         if sig:
                             all_signals.append(sig)
 
-                    elif target.sector == 'semiconductor':
+                    elif target.sector == 'semiconductor' and trade_cfg["strategies"].get("semi", True):
                         sigs = self.chart4.generate_signals(
                             code, daily_df, price, beta,
                             self.chart1.war_day_count,
                             self.ext.nvidia_change,
+                            total_budget=trade_cfg["total_budget"],
+                            per_stock_budget=trade_cfg["per_stock"],
                         )
                         all_signals.extend(sigs)
 
                 for sig in all_signals:
-                    if self.auto_trading_enabled:
+                    if self.auto_trading_enabled and data_health["status"] == "ok" and data_readiness["ready"]:
                         self.executor.process_signal(sig, holdings)
+                    elif self.auto_trading_enabled and (data_health["status"] != "ok" or not data_readiness["ready"]):
+                        self.record_trade_event({
+                            "kind": "order_blocked",
+                            "source": "auto",
+                            "action": sig.action,
+                            "code": sig.code,
+                            "name": sig.name,
+                            "qty": sig.quantity,
+                            "price": sig.price,
+                            "chart": sig.chart,
+                            "reason": f"데이터헬스 차단: {data_health['reason']}",
+                            "status": "blocked",
+                            "signal_ts": sig.timestamp,
+                            "stop_loss": sig.stop_loss,
+                            "take_profit": sig.take_profit,
+                        })
 
                 if WEB_ENABLED:
-                    _update_web_state(self, holdings, all_signals)
+                    _update_web_state_v2(self, holdings, all_signals)
 
                 elapsed = time.time() - cycle_start
                 if self._cycle_count % 5 == 0:
@@ -1545,11 +2211,11 @@ class WarAdaptiveEngine:
         for r in raw:
             rows.append({
                 'time': pd.to_datetime(str(r.get('체결시간', '')), format='%Y%m%d%H%M%S', errors='coerce'),
-                'open': abs(int(r.get('시가', 0))),
-                'high': abs(int(r.get('고가', 0))),
-                'low': abs(int(r.get('저가', 0))),
-                'close': abs(int(r.get('현재가', 0))),
-                'volume': abs(int(r.get('거래량', 0))),
+                'open': abs(_parse_int(r.get('시가', 0), 0)),
+                'high': abs(_parse_int(r.get('고가', 0), 0)),
+                'low': abs(_parse_int(r.get('저가', 0), 0)),
+                'close': abs(_parse_int(r.get('현재가', 0), 0)),
+                'volume': abs(_parse_int(r.get('거래량', 0), 0)),
             })
         df = pd.DataFrame(rows)
         if not df.empty:
@@ -1576,14 +2242,21 @@ def _start_web_server():
 def _update_web_state(engine: 'WarAdaptiveEngine', holdings: list, all_signals: list):
     """매 루프 사이클마다 web engine_state 갱신 — 엔진과 화면 동기화"""
     rt_prices = engine.rt.prices
+    deposit = engine.api.get_deposit()
+    orderable_cash_raw = deposit.get('주문가능금액', '0') if isinstance(deposit, dict) else '0'
+    try:
+        orderable_cash = int(str(orderable_cash_raw).replace(',', '').strip() or '0')
+    except Exception:
+        orderable_cash = 0
 
     # 보유종목: 한국어 키 → 웹 친화적 dict + pnl 계산
     holdings_web = []
     for h in holdings:
         code = h.get('종목코드', '').strip()
-        qty = int(h.get('보유수량', '0'))
-        avg = int(h.get('매입단가', '0'))
-        cur = rt_prices.get(code, avg)
+        qty = _parse_int(h.get('보유수량', '0'), 0)
+        avg = _parse_int(h.get('매입단가', '0'), 0)
+        balance_cur = _parse_int(h.get('현재가', 0), 0)
+        cur = balance_cur or rt_prices.get(code, avg)
         pnl = (cur - avg) * qty
         pnl_pct = round((cur / avg - 1) * 100, 2) if avg > 0 else 0
         name = TARGETS[code].name if code in TARGETS else code
@@ -1597,9 +2270,13 @@ def _update_web_state(engine: 'WarAdaptiveEngine', holdings: list, all_signals: 
     signals_web = [
         {"code": s.code, "name": s.name, "action": s.action,
          "price": s.price, "qty": s.quantity, "confidence": s.confidence,
-         "chart": s.chart, "reason": s.reason, "ts": s.timestamp}
+         "chart": s.chart, "reason": s.reason, "ts": s.timestamp,
+         "stop_loss": s.stop_loss, "take_profit": s.take_profit,
+         "marker_time": _bar_time_from_timestamp(s.timestamp)}
         for s in all_signals[-200:]
     ]
+    manual_signals = engine_state.get("manual_signals", [])
+    merged_signals = (manual_signals + signals_web)[:200]
 
     # 요동장 상태
     ws_status = {}
@@ -1616,6 +2293,38 @@ def _update_web_state(engine: 'WarAdaptiveEngine', holdings: list, all_signals: 
                              if t.buy_locked_until else None),
         }
 
+    # 1분봉 축적 — 실시간 틱 → candle_history (프론트엔드 차트 시드용)
+    now_ts = int(time.time())
+    bar_time = now_ts - (now_ts % 60)
+    candle_hist = engine_state.get("candle_history", {})
+
+    all_codes = list(rt_prices.keys())  # KOSPI 포함
+    for code in all_codes:
+        price = rt_prices.get(code, 0)
+        if price <= 0:
+            continue
+        if code not in candle_hist:
+            candle_hist[code] = []
+        bars = candle_hist[code]
+        if bars and bars[-1]["time"] == bar_time:
+            b = bars[-1]
+            b["high"] = max(b["high"], price)
+            b["low"] = min(b["low"], price)
+            b["close"] = price
+            b["volume"] = b["volume"] + 1
+        else:
+            bars.append({"time": bar_time, "open": price, "high": price,
+                         "low": price, "close": price, "volume": 1})
+            if len(bars) > 600:
+                candle_hist[code] = bars[-600:]
+
+    engine_state["candle_history"] = candle_hist
+    position_overlays = engine.build_position_overlays(holdings)
+    buy_levels = engine.build_buy_levels_map()
+    prev_closes = engine.build_prev_close_map()
+    data_health = engine.assess_data_health()
+    hoga_analysis = {code: overlay.get("hoga", {}) for code, overlay in position_overlays.items()}
+
     engine_state.update({
         "regime": engine.chart1.regime.value,
         "beta": engine.chart1.beta,
@@ -1626,15 +2335,122 @@ def _update_web_state(engine: 'WarAdaptiveEngine', holdings: list, all_signals: 
         "prices": dict(rt_prices),
         "kospi": rt_prices.get('KOSPI', 0),
         "holdings": holdings_web,
-        "signals": signals_web,
+        "signals": merged_signals,
         "whipsaw_status": ws_status,
         "daily_pnl": sum(h["pnl"] for h in holdings_web),
         "phase": engine.whipsaw.get_phase(datetime.now()).value,
         "auto_trading": engine.auto_trading_enabled,
+        "data_health": data_health,
+        "account_no": engine.api.account_no or "",
+        "orderable_cash": orderable_cash,
+        "buy_levels": buy_levels,
+        "prev_closes": prev_closes,
+        "position_overlays": position_overlays,
+        "hoga_analysis": hoga_analysis,
     })
 
 
-# ═══════════════════════════════════════════════════════════════
+def _update_web_state_v2(engine: 'WarAdaptiveEngine', holdings: list, all_signals: list):
+    """Preserve realtime-built candle_history and refresh dashboard state."""
+    rt_prices = engine.rt.prices
+    deposit = engine.api.get_deposit()
+    orderable_cash_raw = deposit.get('주문가능금액', '0') if isinstance(deposit, dict) else '0'
+    try:
+        orderable_cash = int(str(orderable_cash_raw).replace(',', '').strip() or '0')
+    except Exception:
+        orderable_cash = 0
+
+    holdings_web = []
+    for h in holdings:
+        code = h.get('종목코드', '').strip()
+        qty = _parse_int(h.get('보유수량', '0'), 0)
+        avg = _parse_int(h.get('매입단가', '0'), 0)
+        balance_cur = _parse_int(h.get('현재가', 0), 0)
+        cur = balance_cur or rt_prices.get(code, avg)
+        pnl = (cur - avg) * qty
+        pnl_pct = round((cur / avg - 1) * 100, 2) if avg > 0 else 0
+        name = TARGETS[code].name if code in TARGETS else code
+        holdings_web.append({
+            "code": code,
+            "name": name,
+            "qty": qty,
+            "avg_price": avg,
+            "current": cur,
+            "pnl": pnl,
+            "pnl_pct": pnl_pct,
+        })
+
+    signals_web = [
+        {
+            "code": s.code,
+            "name": s.name,
+            "action": s.action,
+            "price": s.price,
+            "qty": s.quantity,
+            "confidence": s.confidence,
+            "chart": s.chart,
+            "reason": s.reason,
+            "ts": s.timestamp,
+            "stop_loss": s.stop_loss,
+            "take_profit": s.take_profit,
+            "marker_time": _bar_time_from_timestamp(s.timestamp),
+        }
+        for s in all_signals[-200:]
+    ]
+    manual_signals = engine_state.get("manual_signals", [])
+    merged_signals = (manual_signals + signals_web)[:200]
+
+    ws_status = {}
+    for code, t in engine.whipsaw.trackers.items():
+        ws_status[code] = {
+            "name": t.name,
+            "flag": (
+                "emergency" if t.sell_triggered else
+                "crash" if t.crash_from_high else
+                "near_limit" if t.hit_near_limit_up else "normal"
+            ),
+            "session_high": t.session_high,
+            "current": t.current_price,
+            "drawdown_pct": round(t.drawdown_from_high_pct * 100, 1),
+            "locked_until": t.buy_locked_until.strftime("%H:%M") if t.buy_locked_until else None,
+        }
+
+    position_overlays = engine.build_position_overlays(holdings)
+    buy_levels = engine.build_buy_levels_map()
+    prev_closes = engine.build_prev_close_map()
+    data_health = engine.assess_data_health()
+    data_readiness = engine.assess_data_readiness() if hasattr(engine, "assess_data_readiness") else {
+        "ready": False,
+        "status": "unknown",
+        "reason": "준비상태 미확인",
+    }
+    hoga_analysis = {code: overlay.get("hoga", {}) for code, overlay in position_overlays.items()}
+
+    engine_state.update({
+        "regime": engine.chart1.regime.value,
+        "beta": engine.chart1.beta,
+        "war_day": engine.chart1.war_day_count,
+        "wti": engine.ext.latest_wti,
+        "usdkrw": engine.ext.usdkrw,
+        "news_sentiment": engine.ext.news_sentiment,
+        "prices": dict(rt_prices),
+        "kospi": rt_prices.get('KOSPI', 0),
+        "holdings": holdings_web,
+        "signals": merged_signals,
+        "whipsaw_status": ws_status,
+        "daily_pnl": sum(h["pnl"] for h in holdings_web),
+        "phase": engine.whipsaw.get_phase(datetime.now()).value,
+        "auto_trading": engine.auto_trading_enabled,
+        "data_health": data_health,
+        "data_readiness": data_readiness,
+        "account_no": engine.api.account_no or "",
+        "orderable_cash": orderable_cash,
+        "buy_levels": buy_levels,
+        "prev_closes": prev_closes,
+        "position_overlays": position_overlays,
+        "hoga_analysis": hoga_analysis,
+    })
+
 # ENTRY POINT
 # ═══════════════════════════════════════════════════════════════
 
