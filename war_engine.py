@@ -15,6 +15,7 @@ import requests
 import json
 import time
 import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import websocket
 import mysql.connector
@@ -30,7 +31,7 @@ import logging
 
 try:
     import uvicorn
-    from web_server import app as _web_app, engine_state, set_engine_ref
+    from web_server import app as _web_app, engine_state, set_engine_ref, mark_engine_dirty
     WEB_ENABLED = True
 except ImportError:
     WEB_ENABLED = False
@@ -99,6 +100,7 @@ def _update_web_tick_state(code: str, price: int, volume: int = 0):
         })
         if len(bars) > 600:
             candle_hist[code] = bars[-600:]
+    mark_engine_dirty(f"tick:{code}")
 
 
 def _merge_lw_candles(history: list, live: list) -> list:
@@ -1555,6 +1557,7 @@ class WarAdaptiveEngine:
     EXTERNAL_INTERVAL = 300
     CENTRAL_HISTORY_MIN_BARS = 60
     CENTRAL_HISTORY_REFRESH_SEC = 20
+    CENTRAL_HISTORY_MAX_WORKERS = 10
     DEFAULT_TRADE_CONFIG = {
         "total_budget": 5_000_000,
         "per_stock": 1_000_000,
@@ -1726,10 +1729,20 @@ class WarAdaptiveEngine:
             })
         return candles
 
+    def _fetch_central_candles_for_code(self, code: str, stop_time: str) -> tuple[str, list]:
+        api_code = "U001" if code == "KOSPI" else code
+        raw = self.api.get_minute_candles(api_code, tick=1, stop_time=stop_time)
+        if not raw:
+            return code, []
+        parsed = self._parse_minute_candles(raw)
+        fetched = self._minute_df_to_lw(parsed)
+        return code, fetched
+
     def sync_central_candle_history(self, force: bool = False):
         candle_hist = engine_state.setdefault("candle_history", {})
         codes = ["KOSPI", *list(TARGETS.keys())]
         stop_time = (datetime.now() - timedelta(days=3)).strftime("%Y%m%d090000")
+        pending_codes = []
 
         for code in codes:
             bars = candle_hist.get(code, [])
@@ -1737,19 +1750,57 @@ class WarAdaptiveEngine:
             recently_synced = last_sync and (datetime.now() - last_sync).total_seconds() < self.CENTRAL_HISTORY_REFRESH_SEC
             if not force and recently_synced and len(bars) >= self.CENTRAL_HISTORY_MIN_BARS:
                 continue
+            pending_codes.append(code)
 
-            api_code = "U001" if code == "KOSPI" else code
-            raw = self.api.get_minute_candles(api_code, tick=1, stop_time=stop_time)
-            if not raw:
-                continue
+        if not pending_codes:
+            return
 
-            parsed = self._parse_minute_candles(raw)
-            fetched = self._minute_df_to_lw(parsed)
-            if not fetched:
-                continue
+        max_workers = min(self.CENTRAL_HISTORY_MAX_WORKERS, len(pending_codes))
+        started_at = datetime.now()
+        completed = 0
+        failed = 0
 
-            candle_hist[code] = _merge_lw_candles(fetched, bars)[-600:]
-            self._last_candle_sync_at[code] = datetime.now()
+        log.info(
+            f"중앙 캔들 병렬 동기화 시작: {len(pending_codes)}종목 "
+            f"(workers={max_workers}, force={force}) -> {', '.join(pending_codes)}"
+        )
+
+        with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="candle-sync") as executor:
+            futures = {
+                executor.submit(self._fetch_central_candles_for_code, code, stop_time): code
+                for code in pending_codes
+            }
+            for future in as_completed(futures):
+                code = futures[future]
+                try:
+                    result_code, fetched = future.result()
+                except Exception as exc:
+                    failed += 1
+                    log.warning(f"중앙 캔들 병렬 수집 실패: {code} / {exc}")
+                    continue
+                elapsed = (datetime.now() - started_at).total_seconds()
+                if not fetched:
+                    failed += 1
+                    log.warning(
+                        f"중앙 캔들 병렬 수집 빈응답: {result_code} "
+                        f"({completed + failed}/{len(pending_codes)}, {elapsed:.2f}s)"
+                    )
+                    continue
+                bars = candle_hist.get(result_code, [])
+                candle_hist[result_code] = _merge_lw_candles(fetched, bars)[-600:]
+                self._last_candle_sync_at[result_code] = datetime.now()
+                completed += 1
+                log.info(
+                    f"중앙 캔들 병렬 수집 완료: {result_code} "
+                    f"{len(fetched)}bars -> merged {len(candle_hist[result_code])}bars "
+                    f"({completed + failed}/{len(pending_codes)}, {elapsed:.2f}s)"
+                )
+
+        elapsed = (datetime.now() - started_at).total_seconds()
+        log.info(
+            f"중앙 캔들 병렬 동기화 종료: success={completed}, failed={failed}, "
+            f"total={len(pending_codes)} ({elapsed:.2f}s, workers={max_workers})"
+        )
 
     def assess_data_readiness(self) -> dict:
         candle_hist = engine_state.get("candle_history", {})
@@ -2348,6 +2399,8 @@ def _update_web_state(engine: 'WarAdaptiveEngine', holdings: list, all_signals: 
         "position_overlays": position_overlays,
         "hoga_analysis": hoga_analysis,
     })
+    if WEB_ENABLED:
+        mark_engine_dirty("web_state_v2")
 
 
 def _update_web_state_v2(engine: 'WarAdaptiveEngine', holdings: list, all_signals: list):

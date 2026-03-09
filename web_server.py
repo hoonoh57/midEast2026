@@ -7,6 +7,7 @@ web_server.py — FastAPI 기반 WYSIWYT 웹 트레이딩 서버 v3.1
 import asyncio
 import json
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 from typing import Dict, Set
@@ -104,6 +105,7 @@ engine_state: Dict = {
     "auto_trading": False,
     "trade_config": _copy_trade_config(),
     "candle_history": {},
+    "candle_store": {"m1": {}},
     "buy_levels": {},
     "prev_closes": {},
     "position_overlays": {},
@@ -115,7 +117,17 @@ engine_state: Dict = {
     "pnl_history": [],
     "account_no": "",
     "orderable_cash": 0,
+    "_dirty_seq": 0,
+    "_last_dirty_reason": "bootstrap",
 }
+
+MAX_CANDLE_FETCH_WORKERS = 10
+HEARTBEAT_INTERVAL_SEC = 5.0
+
+
+def mark_engine_dirty(reason: str = "state"):
+    engine_state["_dirty_seq"] = int(engine_state.get("_dirty_seq", 0) or 0) + 1
+    engine_state["_last_dirty_reason"] = reason
 
 
 def _normalize_trade_config(msg: dict) -> dict:
@@ -236,6 +248,7 @@ def _auto_trade_gate() -> tuple[bool, str, dict, dict]:
 @app.websocket("/ws/dashboard")
 async def ws_dashboard(ws: WebSocket):
     await manager.connect(ws)
+    _refresh_m1_candle_store()
     await ws.send_text(json.dumps({
         "type": "snapshot",
         "data": engine_state,
@@ -386,6 +399,7 @@ async def handle_client_command(msg: dict, ws: WebSocket):
         if engine_ref is not None:
             engine_ref.auto_trading_enabled = enabled
         engine_state["auto_trading"] = enabled
+        mark_engine_dirty("toggle_auto")
         await manager.broadcast({
             "type": "config_changed",
             "auto_trading": enabled,
@@ -400,13 +414,28 @@ async def handle_client_command(msg: dict, ws: WebSocket):
             return
         engine_state["regime"] = regime_value
         engine_state["regime_override"] = regime_value
+        mark_engine_dirty("set_regime")
         await manager.broadcast({"type": "config_changed", "regime": regime_value, "regime_override": regime_value})
     elif cmd == "set_config":
         config = _normalize_trade_config(msg)
         engine_state["trade_config"] = config
         if engine_ref is not None:
             engine_ref.trade_config = config
+        mark_engine_dirty("set_config")
         await manager.broadcast({"type": "config_changed", "trade_config": config})
+    elif cmd == "set_view":
+        tf = str(msg.get("tf", "m1") or "m1")
+        codes = [str(code).strip() for code in msg.get("codes", []) if str(code).strip()]
+        if not codes:
+            await ws.send_text(json.dumps({"type": "error", "msg": "view codes가 비어 있습니다"}, ensure_ascii=False, default=str))
+            return
+        _refresh_candle_store(tf, codes)
+        await manager.broadcast({
+            "type": "view_changed",
+            "tf": tf,
+            "codes": codes,
+            "candle_store": engine_state.get("candle_store", {}),
+        })
 
 
 @app.get("/api/state")
@@ -618,6 +647,46 @@ def _get_candles_for_code(code: str, tf: str) -> list:
     return []
 
 
+def _refresh_m1_candle_store(codes: list[str] | None = None):
+    candle_hist = engine_state.get("candle_history", {})
+    target_codes = codes or list(candle_hist.keys())
+    store = dict(engine_state.get("candle_store", {}))
+    store["m1"] = {code: candle_hist.get(code, []) for code in target_codes if candle_hist.get(code) is not None}
+    engine_state["candle_store"] = store
+
+
+def _refresh_candle_store(tf: str, codes: list[str]) -> dict:
+    normalized_codes = [code for code in dict.fromkeys(codes or []) if code]
+    store = dict(engine_state.get("candle_store", {}))
+    if tf == "m1":
+        _refresh_m1_candle_store(normalized_codes)
+        return engine_state.get("candle_store", {}).get("m1", {})
+
+    result = {}
+    max_workers = min(MAX_CANDLE_FETCH_WORKERS, len(normalized_codes)) if normalized_codes else 0
+    if max_workers <= 0:
+        store[tf] = {}
+        engine_state["candle_store"] = store
+        return {}
+
+    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"ws-{tf}") as executor:
+        futures = {
+            executor.submit(_get_candles_for_code, code, tf): code
+            for code in normalized_codes
+        }
+        for future in as_completed(futures):
+            code = futures[future]
+            try:
+                result[code] = future.result()
+            except Exception as exc:
+                print(f"[web_server] candle_store refresh error: {code}/{tf}: {exc}")
+                result[code] = []
+
+    store[tf] = result
+    engine_state["candle_store"] = store
+    return result
+
+
 @app.get("/api/candles/{code}")
 async def get_candles(code: str, tf: str = Query(default="m1")):
     """타임프레임별 캔들 데이터 반환"""
@@ -650,42 +719,62 @@ else:
 
 async def push_loop():
     prev_snapshot = ""
+    prev_dirty_seq = int(engine_state.get("_dirty_seq", 0) or 0)
+    last_heartbeat = 0.0
     while True:
-        snapshot = json.dumps({
-            "type": "update",
-            "prices": engine_state["prices"],
-            "regime": engine_state["regime"],
-            "beta": engine_state["beta"],
-            "war_day": engine_state.get("war_day", 4),
-            "wti": engine_state["wti"],
-            "usdkrw": engine_state["usdkrw"],
-            "news_sentiment": engine_state.get("news_sentiment", "NEUTRAL"),
-            "phase": engine_state["phase"],
-            "whipsaw_status": engine_state["whipsaw_status"],
-            "daily_pnl": engine_state["daily_pnl"],
-            "holdings": engine_state["holdings"],
-            "signals": engine_state["signals"],
-            "trade_logs": engine_state.get("trade_logs", []),
-            "buy_levels": engine_state.get("buy_levels", {}),
-            "prev_closes": engine_state.get("prev_closes", {}),
-            "position_overlays": engine_state.get("position_overlays", {}),
-            "hoga_analysis": engine_state.get("hoga_analysis", {}),
-            "data_health": engine_state.get("data_health", {}),
-            "data_readiness": engine_state.get("data_readiness", {}),
-            "kospi": engine_state.get("kospi", 0),
-            "auto_trading": engine_state.get("auto_trading", True),
-            "account_no": engine_state.get("account_no", ""),
-            "orderable_cash": engine_state.get("orderable_cash", 0),
-            "trade_config": engine_state.get("trade_config", _copy_trade_config()),
-            "pnl_history": engine_state.get("pnl_history", []),
-            "ts": datetime.now().isoformat(),
-        }, ensure_ascii=False, default=str)
+        dirty_seq = int(engine_state.get("_dirty_seq", 0) or 0)
+        if dirty_seq != prev_dirty_seq:
+            snapshot_payload = {
+                "prices": engine_state["prices"],
+                "regime": engine_state["regime"],
+                "beta": engine_state["beta"],
+                "war_day": engine_state.get("war_day", 4),
+                "wti": engine_state["wti"],
+                "usdkrw": engine_state["usdkrw"],
+                "news_sentiment": engine_state.get("news_sentiment", "NEUTRAL"),
+                "phase": engine_state["phase"],
+                "whipsaw_status": engine_state["whipsaw_status"],
+                "daily_pnl": engine_state["daily_pnl"],
+                "holdings": engine_state["holdings"],
+                "signals": engine_state["signals"],
+                "trade_logs": engine_state.get("trade_logs", []),
+                "buy_levels": engine_state.get("buy_levels", {}),
+                "prev_closes": engine_state.get("prev_closes", {}),
+                "position_overlays": engine_state.get("position_overlays", {}),
+                "hoga_analysis": engine_state.get("hoga_analysis", {}),
+                "data_health": engine_state.get("data_health", {}),
+                "data_readiness": engine_state.get("data_readiness", {}),
+                "kospi": engine_state.get("kospi", 0),
+                "auto_trading": engine_state.get("auto_trading", True),
+                "account_no": engine_state.get("account_no", ""),
+                "orderable_cash": engine_state.get("orderable_cash", 0),
+                "trade_config": engine_state.get("trade_config", _copy_trade_config()),
+                "pnl_history": engine_state.get("pnl_history", []),
+            }
+            snapshot = json.dumps(snapshot_payload, ensure_ascii=False, default=str)
 
-        if snapshot != prev_snapshot:
-            await manager.broadcast(json.loads(snapshot))
-            prev_snapshot = snapshot
+            if snapshot != prev_snapshot:
+                await manager.broadcast({
+                    "type": "update",
+                    **snapshot_payload,
+                    "ts": datetime.now().isoformat(),
+                })
+                prev_snapshot = snapshot
+            prev_dirty_seq = dirty_seq
 
-        await asyncio.sleep(0.1)
+        now = time.time()
+        if now - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
+            await manager.broadcast({
+                "type": "heartbeat",
+                "ts": datetime.now().isoformat(),
+                "data_health": engine_state.get("data_health", {}),
+                "data_readiness": engine_state.get("data_readiness", {}),
+                "dirty_seq": int(engine_state.get("_dirty_seq", 0) or 0),
+                "reason": engine_state.get("_last_dirty_reason", ""),
+            })
+            last_heartbeat = now
+
+        await asyncio.sleep(0.25)
 
 
 engine_ref = None
@@ -731,5 +820,7 @@ def set_engine_ref(engine, server32_client=None):
         engine_state["data_health"] = engine.assess_data_health()
     if hasattr(engine, "assess_data_readiness"):
         engine_state["data_readiness"] = engine.assess_data_readiness()
+    _refresh_m1_candle_store()
+    mark_engine_dirty("set_engine_ref")
     if server32_client:
         engine_ref.api = server32_client

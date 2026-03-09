@@ -312,7 +312,13 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, posi
       rsiSeries.createPriceLine({ price: 70, color: '#ff444466', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })
       rsiSeries.createPriceLine({ price: 30, color: '#00cc6666', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })
       rsiSeries.createPriceLine({ price: 50, color: '#ffffff22', lineWidth: 1, lineStyle: 2, axisLabelVisible: false })
-      try { chart.panes()[1]?.setHeight(80) } catch(_) {}
+      try {
+        const totalPaneHeight = Math.max(containerRef.current?.clientHeight || 260, 180)
+        const mainPaneHeight = Math.round(totalPaneHeight * 0.7)
+        const subPaneHeight = Math.max(60, totalPaneHeight - mainPaneHeight)
+        chart.panes()[0]?.setHeight(mainPaneHeight)
+        chart.panes()[1]?.setHeight(subPaneHeight)
+      } catch(_) {}
     }
     rsiSeriesRef.current = rsiSeries
 
@@ -385,31 +391,13 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, posi
       redrawIndicators(candles)
     }
 
-    // m1: __CANDLE_HISTORY 시드 사용 / 그 외: 서버에서 받은 candleData만 사용
-    const candles = candleData != null
-      ? candleData
-      : (tf === 'm1' ? (window.__CANDLE_HISTORY?.[code] || []) : [])
+    // 중앙 candle_store/state만 사용한다. 차트별 개별 fetch는 금지.
+    const candles = Array.isArray(candleData) ? candleData : []
     applyCandles(candles)
-
-    let cancelled = false
-    if (tf === 'm1' && candles.length < 30) {
-      fetch(`/api/candles/${code}?tf=m1`)
-        .then(resp => resp.ok ? resp.json() : Promise.reject(new Error(`HTTP ${resp.status}`)))
-        .then(json => {
-          const fetched = Array.isArray(json.candles) ? json.candles : []
-          if (!cancelled && fetched.length > candles.length) {
-            applyCandles(fetched)
-          }
-        })
-        .catch(err => {
-          console.error(`m1 candle bootstrap failed for ${code}:`, err)
-        })
-    }
 
     if (onChartReady && chartKey) onChartReady(chartKey, chart, candleSeries)
 
     return () => {
-      cancelled = true
       redrawIndicatorsRef.current = null
       if (onChartDestroy && chartKey) onChartDestroy(chartKey)
       chart.remove()
@@ -1329,7 +1317,6 @@ export default function TradingDashboard() {
   const [buyConfirm, setBuyConfirm] = useState(null)
   const [sellConfirm, setSellConfirm] = useState(null)
   const [tf, setTF] = useState('m1')
-  const [candleCache, setCandleCache] = useState({})
   const [indicators, setIndicators] = useState({
     supertrend: { enabled: true, period: 10, multiplier: 3 },
     jma: { enabled: true, period: 7, phase: 50, power: 2 },
@@ -1405,49 +1392,10 @@ export default function TradingDashboard() {
     })
   }, [loadThemes])
 
-  const fetchCandlesForTF = useCallback(async (targetTF, codes) => {
-    const codeList = [...new Set((codes || []).filter(Boolean))]
-    if (targetTF === 'm1' || codeList.length === 0) return
-    const resp = await fetch(`/api/candles_batch?codes=${codeList.join(',')}&tf=${targetTF}`)
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
-    const json = await resp.json()
-    if (json.candles && typeof json.candles === 'object') {
-      setCandleCache(prev => ({
-        ...prev,
-        [targetTF]: {
-          ...(prev[targetTF] || {}),
-          ...json.candles,
-        },
-      }))
-    }
-  }, [])
-
-  // fetch 완료 후 setTF → 차트 렌더 시 candleData 항상 존재 (빈 차트 방지)
-  const handleChangeTF = useCallback(async (newTF) => {
+  const handleChangeTF = useCallback((newTF) => {
     if (newTF === tf) return
-    if (newTF === 'm1') { setCandleCache({}); setTF('m1'); return }
-    try {
-      const codes = panels.slice(0, visibleCount).map(p => p.code)
-      await fetchCandlesForTF(newTF, codes)
-      setTF(newTF)
-    } catch(e) {
-      console.error('TF 전환 실패:', e)
-    }
-  }, [tf, panels, visibleCount, fetchCandlesForTF])
-
-  useEffect(() => {
-    if (tf === 'm1') return
-    const visibleCodes = panels.slice(0, visibleCount).map(p => p.code)
-    const cached = candleCache[tf] || {}
-    const missingCodes = visibleCodes.filter(code => cached[code] == null)
-    if (missingCodes.length === 0) return
-
-    let cancelled = false
-    fetchCandlesForTF(tf, missingCodes).catch(err => {
-      if (!cancelled) console.error('추가 패널 캔들 로드 실패:', err)
-    })
-    return () => { cancelled = true }
-  }, [tf, panels, visibleCount, candleCache, fetchCandlesForTF])
+    setTF(newTF)
+  }, [tf])
 
   // WebSocket
   useEffect(() => {
@@ -1460,7 +1408,6 @@ export default function TradingDashboard() {
       ws.current.onmessage = (e) => {
         const msg = JSON.parse(e.data)
         if (msg.type === 'snapshot') {
-          if (msg.data.candle_history) window.__CANDLE_HISTORY = msg.data.candle_history
           if (msg.data.buy_levels) window.__BUY_LEVELS = msg.data.buy_levels
           if (msg.data.kospi_prev_close) window.__KOSPI_PREV = msg.data.kospi_prev_close
           prevSignalCountRef.current = msg.data.signals?.length || 0
@@ -1493,6 +1440,7 @@ export default function TradingDashboard() {
               kospi: msg.kospi ?? prev.kospi,
               auto_trading: msg.auto_trading ?? prev.auto_trading,
               trade_config: msg.trade_config ?? prev.trade_config,
+              candle_store: msg.candle_store ?? prev.candle_store,
               pnl_history: msg.pnl_history ?? prev.pnl_history,
             }
             const nc = next.signals?.length || 0
@@ -1514,6 +1462,15 @@ export default function TradingDashboard() {
               trade_config: msg.trade_config ?? prev.trade_config,
               data_health: msg.data_health ?? prev.data_health,
               data_readiness: msg.data_readiness ?? prev.data_readiness,
+            }
+          })
+        }
+        if (msg.type === 'view_changed') {
+          setState(prev => {
+            if (!prev) return prev
+            return {
+              ...prev,
+              candle_store: msg.candle_store ?? prev.candle_store,
             }
           })
         }
@@ -1602,6 +1559,13 @@ export default function TradingDashboard() {
   const send = useCallback((payload) => {
     if (ws.current?.readyState === WebSocket.OPEN) ws.current.send(JSON.stringify(payload))
   }, [])
+  useEffect(() => {
+    if (!connected) return
+    const visibleCodes = panels.slice(0, visibleCount).map(p => p.code).filter(Boolean)
+    if (!visibleCodes.length) return
+    send({ cmd: 'set_view', tf, codes: visibleCodes })
+  }, [connected, panels, visibleCount, tf, send])
+
   const autoTradeBlockedReason = state?.data_health?.status !== 'ok'
     ? state?.data_health?.reason
     : (state?.data_readiness?.ready === false ? state?.data_readiness?.reason : '')
@@ -1746,7 +1710,7 @@ export default function TradingDashboard() {
           gap:2, padding:2, overflow:'hidden', minHeight:0, flex:1,
         }}>
           {currentPanels.map((p, idx) => {
-            const candleData = tf !== 'm1' ? (candleCache[tf]?.[p.code] ?? null) : null
+            const candleData = state?.candle_store?.[tf]?.[p.code] ?? null
             const positionOverlay = state?.position_overlays?.[p.code] ?? null
             const signalMarkers = (state?.signals || [])
               .filter(s => s.code === p.code && (s.action === 'BUY' || s.action === 'SELL'))
