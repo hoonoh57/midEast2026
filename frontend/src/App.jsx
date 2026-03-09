@@ -222,7 +222,7 @@ function calcJMA(candles, period = 7, phase = 50, power = 2) {
 // 실시간 캔들 차트 + SuperTrend + JMA + RSI
 // ═══════════════════════════════════════════════════════════════
 
-function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, positionOverlay, signalMarkers, focused, onFocus, onBuy, onSell, tf, indicators, onToggleIndicator, candleData, chartKey, onChartReady, onChartDestroy }) {
+function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, positionOverlay, signalMarkers, codeStatus, focused, onFocus, onBuy, onSell, tf, indicators, onToggleIndicator, candleData, chartKey, onChartReady, onChartDestroy }) {
   const containerRef = useRef(null)
   const candleSeriesRef = useRef(null)
   const volumeSeriesRef = useRef(null)
@@ -260,6 +260,11 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, posi
       upColor: '#ef5350', downColor: '#2962ff',
       borderUpColor: '#ef5350', borderDownColor: '#2962ff',
       wickUpColor: '#ef5350', wickDownColor: '#2962ff',
+      priceFormat: {
+        type: 'custom',
+        minMove: 1,
+        formatter: (price) => Math.round(Number(price || 0)).toLocaleString('ko-KR'),
+      },
     })
     const volumeSeries = chart.addSeries(HistogramSeries, {
       priceFormat: { type: 'volume' }, priceScaleId: 'volume',
@@ -445,6 +450,14 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, posi
   const flagColor = { emergency:'#ff0000', crash:'#ff4444', near_limit:'#ffaa00', normal:'#00cc66' }[whipsaw?.flag] || '#333'
   const borderColor = focused ? '#ffcc00' : flagColor
   const isBuyDisabled = whipsaw?.flag === 'near_limit' || whipsaw?.flag === 'emergency'
+  const statusPalette = {
+    ready: { fg:'#86efac', bg:'#052e16', border:'#166534', label:'READY' },
+    loading: { fg:'#fde68a', bg:'#3a2a05', border:'#a16207', label:'LOAD' },
+    stale: { fg:'#fca5a5', bg:'#3f0d0d', border:'#b91c1c', label:'STALE' },
+    error: { fg:'#fecaca', bg:'#450a0a', border:'#dc2626', label:'ERROR' },
+    closed: { fg:'#cbd5e1', bg:'#0f172a', border:'#475569', label:'CLOSED' },
+  }
+  const statusStyle = statusPalette[codeStatus?.status] || { fg:'#94a3b8', bg:'#111827', border:'#334155', label:'UNK' }
   const handleToggle = (key, checked) => {
     if (onToggleIndicator) onToggleIndicator(key, checked)
   }
@@ -463,6 +476,7 @@ function RealtimeChart({ code, title, price, prevPrice, whipsaw, buyLevels, posi
         <span style={{ fontWeight: 'bold', fontSize: 11, color: focused ? '#ffcc00' : '#eee', minWidth: 55 }}>{title}</span>
         <span style={{ fontSize: 11, fontWeight: 'bold', color: chgColor }}>{price?.toLocaleString()}</span>
         <span style={{ fontSize: 9, color: chgColor }}>{chg >= 0 ? '+' : ''}{chg.toFixed(2)}%</span>
+        <span title={codeStatus?.reason || ''} style={{ fontSize: 8, fontWeight: 'bold', padding: '1px 4px', borderRadius: 4, color: statusStyle.fg, background: statusStyle.bg, border: `1px solid ${statusStyle.border}` }}>{statusStyle.label}</span>
         {whipsaw?.drawdown_pct ? <span style={{ fontSize: 8, color: '#ff8888' }}>↓{whipsaw.drawdown_pct}%</span> : null}
         {indicators.supertrend.enabled && stTrend !== null && (
           <span style={{ fontSize: 10, color: stTrend === 1 ? '#00cc66' : '#ff8800' }}>{stTrend === 1 ? '▲' : '▼'}</span>
@@ -539,7 +553,13 @@ function MacroBar({ state }) {
   const pnlColor = daily_pnl >= 0 ? '#00cc66' : '#ff4444'
   const rc = { EXTREME_CRISIS:'#ff0000', CRISIS:'#ff2222', CAUTIOUS:'#ffaa00', RECOVERY:'#00cc66', AGGRESSIVE:'#00ff44' }
   const acctSuffix = account_no ? String(account_no).slice(-4) : '----'
-  const healthColor = data_health?.status === 'critical' ? '#fda4af' : data_health?.status === 'warning' ? '#facc15' : '#86efac'
+  const healthColor = data_health?.status === 'critical'
+    ? '#fda4af'
+    : data_health?.status === 'warning'
+      ? '#facc15'
+      : data_health?.status === 'closed'
+        ? '#cbd5e1'
+        : '#86efac'
   const readinessColor = data_readiness?.ready ? '#86efac' : '#facc15'
   return (
     <div style={{ display:'flex', alignItems:'center', gap:14, padding:'3px 12px', background:'#0d0d1a', borderBottom:'1px solid #222', fontSize:11, flexWrap:'wrap', flexShrink:0 }}>
@@ -1131,7 +1151,15 @@ function SidePanel({ state, panels, focusedIdx, onChangeFocused, onChangePanel, 
   const focusCode = panels[focusedIdx]?.code
   const focusOverlay = focusCode ? state?.position_overlays?.[focusCode] : null
   const focusHoga = focusOverlay?.hoga ?? (focusCode ? state?.hoga_analysis?.[focusCode] : null)
+  const codeDataStatus = state?.code_data_status || {}
   const actionColor = { BUY:'#0c6', SELL:'#f44', HOLD:'#888' }
+  const statusPalette = {
+    ready: { fg:'#86efac', bg:'#052e16', border:'#166534', label:'READY' },
+    loading: { fg:'#fde68a', bg:'#3a2a05', border:'#a16207', label:'LOAD' },
+    stale: { fg:'#fca5a5', bg:'#3f0d0d', border:'#b91c1c', label:'STALE' },
+    error: { fg:'#fecaca', bg:'#450a0a', border:'#dc2626', label:'ERROR' },
+    closed: { fg:'#cbd5e1', bg:'#0f172a', border:'#475569', label:'CLOSED' },
+  }
   const filteredSignals = sigFilter === 'ALL' ? signals : signals.filter(s => s.action === sigFilter)
 
   return (
@@ -1182,14 +1210,41 @@ function SidePanel({ state, panels, focusedIdx, onChangeFocused, onChangePanel, 
       <div style={{ padding:'3px 8px', borderBottom:'1px solid #222' }}>
         <div style={{ display:'flex', flexWrap:'wrap', gap:2 }}>
           {panels.map((p,i) => (
+            (() => {
+              const itemStatus = codeDataStatus[p.code] || {}
+              const style = statusPalette[itemStatus.status] || { fg:'#94a3b8', bg:'#111827', border:'#334155', label:'UNK' }
+              return (
             <button key={i} onClick={() => onChangeFocused(i)} style={{
               fontSize:8, padding:'1px 4px', cursor:'pointer', borderRadius:2,
               background: i === focusedIdx ? '#1a1500' : '#111',
               color: i === focusedIdx ? '#ffcc00' : '#888',
               border: `1px solid ${i === focusedIdx ? '#665500' : '#333'}`,
-            }}>{i+1}.{p.title}</button>
+            }} title={itemStatus.reason || ''}>{i+1}.{p.title} <span style={{ color: style.fg }}>{style.label}</span></button>
+              )
+            })()
           ))}
         </div>
+      </div>
+
+      <div style={{ padding:'4px 8px', borderBottom:'1px solid #222' }}>
+        <div style={{ fontSize:10, color:'#666', marginBottom:2 }}>데이터 상태</div>
+        {(() => {
+          const itemStatus = codeDataStatus[focusCode] || {}
+          const style = statusPalette[itemStatus.status] || { fg:'#94a3b8', bg:'#111827', border:'#334155', label:'UNK' }
+          return (
+            <div style={{ fontSize:9, lineHeight:1.7, color:'#ccc' }}>
+              <div>
+                <span style={{
+                  display:'inline-block', fontSize:8, fontWeight:'bold', padding:'1px 4px', borderRadius:4,
+                  color: style.fg, background: style.bg, border:`1px solid ${style.border}`, marginRight:6,
+                }}>{style.label}</span>
+                <span>{itemStatus.reason || '상태 없음'}</span>
+              </div>
+              <div>캔들 {itemStatus.bars ?? 0}/{itemStatus.required_bars ?? 0}</div>
+              {itemStatus.stale_seconds != null ? <div>틱 지연 {itemStatus.stale_seconds}s</div> : null}
+            </div>
+          )
+        })()}
       </div>
 
       <div style={{ padding:'4px 8px', borderBottom:'1px solid #222' }}>
@@ -1437,6 +1492,7 @@ export default function TradingDashboard() {
               hoga_analysis: msg.hoga_analysis ?? prev.hoga_analysis,
               data_health: msg.data_health ?? prev.data_health,
               data_readiness: msg.data_readiness ?? prev.data_readiness,
+              code_data_status: msg.code_data_status ?? prev.code_data_status,
               kospi: msg.kospi ?? prev.kospi,
               auto_trading: msg.auto_trading ?? prev.auto_trading,
               trade_config: msg.trade_config ?? prev.trade_config,
@@ -1459,11 +1515,12 @@ export default function TradingDashboard() {
               ...prev,
               auto_trading: msg.auto_trading ?? prev.auto_trading,
               regime: msg.regime ?? msg.regime_override ?? prev.regime,
-              trade_config: msg.trade_config ?? prev.trade_config,
-              data_health: msg.data_health ?? prev.data_health,
-              data_readiness: msg.data_readiness ?? prev.data_readiness,
-            }
-          })
+                trade_config: msg.trade_config ?? prev.trade_config,
+                data_health: msg.data_health ?? prev.data_health,
+                data_readiness: msg.data_readiness ?? prev.data_readiness,
+                code_data_status: msg.code_data_status ?? prev.code_data_status,
+              }
+            })
         }
         if (msg.type === 'view_changed') {
           setState(prev => {
@@ -1471,6 +1528,17 @@ export default function TradingDashboard() {
             return {
               ...prev,
               candle_store: msg.candle_store ?? prev.candle_store,
+            }
+          })
+        }
+        if (msg.type === 'heartbeat') {
+          setState(prev => {
+            if (!prev) return prev
+            return {
+              ...prev,
+              data_health: msg.data_health ?? prev.data_health,
+              data_readiness: msg.data_readiness ?? prev.data_readiness,
+              code_data_status: msg.code_data_status ?? prev.code_data_status,
             }
           })
         }
@@ -1710,8 +1778,10 @@ export default function TradingDashboard() {
           gap:2, padding:2, overflow:'hidden', minHeight:0, flex:1,
         }}>
           {currentPanels.map((p, idx) => {
-            const candleData = state?.candle_store?.[tf]?.[p.code] ?? null
+            const candleData = state?.candle_store?.[tf]?.[p.code]
+              ?? (tf === 'm1' ? (state?.candle_history?.[p.code] ?? null) : null)
             const positionOverlay = state?.position_overlays?.[p.code] ?? null
+            const codeStatus = state?.code_data_status?.[p.code] ?? null
             const signalMarkers = (state?.signals || [])
               .filter(s => s.code === p.code && (s.action === 'BUY' || s.action === 'SELL'))
               .slice(0, 20)
@@ -1741,6 +1811,7 @@ export default function TradingDashboard() {
                 whipsaw={state?.whipsaw_status?.[p.code]}
                 buyLevels={state?.buy_levels?.[p.code] ?? window.__BUY_LEVELS?.[p.code]}
                 positionOverlay={positionOverlay}
+                codeStatus={codeStatus}
                 signalMarkers={signalMarkers}
                 focused={idx === focusedIdx}
                 onFocus={() => setFocusedIdx(idx)}

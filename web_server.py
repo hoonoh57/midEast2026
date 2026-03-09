@@ -113,6 +113,7 @@ engine_state: Dict = {
     "manual_signals": [],
     "data_health": {"status": "unknown", "reason": "초기화중"},
     "data_readiness": {"ready": False, "status": "unknown", "reason": "캔들 준비 대기중"},
+    "code_data_status": {},
     "kospi_prev_close": 0,
     "pnl_history": [],
     "account_no": "",
@@ -744,6 +745,7 @@ async def push_loop():
                 "hoga_analysis": engine_state.get("hoga_analysis", {}),
                 "data_health": engine_state.get("data_health", {}),
                 "data_readiness": engine_state.get("data_readiness", {}),
+                "code_data_status": engine_state.get("code_data_status", {}),
                 "kospi": engine_state.get("kospi", 0),
                 "auto_trading": engine_state.get("auto_trading", True),
                 "account_no": engine_state.get("account_no", ""),
@@ -764,11 +766,19 @@ async def push_loop():
 
         now = time.time()
         if now - last_heartbeat >= HEARTBEAT_INTERVAL_SEC:
+            if engine_ref is not None:
+                if hasattr(engine_ref, "assess_data_health"):
+                    engine_state["data_health"] = engine_ref.assess_data_health() or engine_state.get("data_health", {})
+                if hasattr(engine_ref, "assess_data_readiness"):
+                    engine_state["data_readiness"] = engine_ref.assess_data_readiness() or engine_state.get("data_readiness", {})
+                if hasattr(engine_ref, "assess_code_data_status"):
+                    engine_state["code_data_status"] = engine_ref.assess_code_data_status() or engine_state.get("code_data_status", {})
             await manager.broadcast({
                 "type": "heartbeat",
                 "ts": datetime.now().isoformat(),
                 "data_health": engine_state.get("data_health", {}),
                 "data_readiness": engine_state.get("data_readiness", {}),
+                "code_data_status": engine_state.get("code_data_status", {}),
                 "dirty_seq": int(engine_state.get("_dirty_seq", 0) or 0),
                 "reason": engine_state.get("_last_dirty_reason", ""),
             })
@@ -820,6 +830,8 @@ def set_engine_ref(engine, server32_client=None):
         engine_state["data_health"] = engine.assess_data_health()
     if hasattr(engine, "assess_data_readiness"):
         engine_state["data_readiness"] = engine.assess_data_readiness()
+    if hasattr(engine, "assess_code_data_status"):
+        engine_state["code_data_status"] = engine.assess_code_data_status()
     _refresh_m1_candle_store()
     mark_engine_dirty("set_engine_ref")
     if server32_client:

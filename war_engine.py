@@ -1837,6 +1837,66 @@ class WarAdaptiveEngine:
             "loading_codes": loading_codes[:6],
         }
 
+    def get_market_session_status(self) -> dict:
+        now = datetime.now()
+        weekday = now.weekday()
+        minutes = now.hour * 60 + now.minute
+
+        if weekday >= 5:
+            return {"is_open": False, "status": "closed", "reason": "주말"}
+        if minutes < 9 * 60:
+            return {"is_open": False, "status": "preopen", "reason": "장 시작 전"}
+        if minutes >= (15 * 60 + 30):
+            return {"is_open": False, "status": "closed", "reason": "장 마감"}
+        return {"is_open": True, "status": "open", "reason": "정규장"}
+
+    def assess_code_data_status(self) -> dict:
+        candle_hist = engine_state.get("candle_history", {})
+        now = datetime.now()
+        session = self.get_market_session_status()
+        result = {}
+
+        codes = ["KOSPI", *list(self.targets.keys())]
+        for code in codes:
+            bars = candle_hist.get(code, [])
+            last_tick_at = self.rt.last_tick_at.get(code)
+            stale_seconds = int((now - last_tick_at).total_seconds()) if last_tick_at else None
+
+            status = "ready"
+            reason = "중앙 캔들 준비 + 틱 정상"
+            if len(bars) == 0:
+                status = "error" if self.rt.connection_status != "connected" else "loading"
+                reason = "캔들 없음"
+            elif len(bars) < self.CENTRAL_HISTORY_MIN_BARS:
+                status = "loading"
+                reason = f"캔들 부족 {len(bars)}/{self.CENTRAL_HISTORY_MIN_BARS}"
+            elif not session["is_open"]:
+                status = "closed"
+                reason = session["reason"]
+            elif stale_seconds is None:
+                status = "stale"
+                reason = "틱 미수신"
+            elif stale_seconds > 15:
+                status = "stale"
+                reason = f"틱 지연 {stale_seconds}s"
+
+            if self.rt.connection_status != "connected" and status == "ready":
+                status = "error"
+                reason = f"WS {self.rt.connection_status}"
+
+            result[code] = {
+                "status": status,
+                "reason": reason,
+                "bars": len(bars),
+                "required_bars": self.CENTRAL_HISTORY_MIN_BARS,
+                "last_tick_at": last_tick_at.isoformat() if last_tick_at else None,
+                "stale_seconds": stale_seconds,
+                "connection": self.rt.connection_status,
+                "session": session["status"],
+            }
+
+        return result
+
     def _calc_recent_atr(self, code: str, period: int = 14) -> float:
         min_df = self.rt.get_minute_df(code)
         if len(min_df) < period + 2:
@@ -1926,6 +1986,7 @@ class WarAdaptiveEngine:
     def assess_data_health(self) -> dict:
         codes = list(self.targets.keys())
         now = datetime.now()
+        session = self.get_market_session_status()
         stale_codes = []
         latest_tick_at = None
         latest_bar_at = None
@@ -1950,7 +2011,10 @@ class WarAdaptiveEngine:
         stale_ratio = (len(stale_codes) / len(codes)) if codes else 0
         status = "ok"
         reason = "실시간 정상"
-        if self.rt.connection_status != "connected":
+        if not session["is_open"]:
+            status = "closed"
+            reason = session["reason"]
+        elif self.rt.connection_status != "connected":
             status = "critical"
             reason = f"실시간 WS {self.rt.connection_status}"
         elif stale_ratio >= 0.5:
@@ -1967,6 +2031,7 @@ class WarAdaptiveEngine:
         return {
             "status": status,
             "reason": reason,
+            "session": session["status"],
             "connection": self.rt.connection_status,
             "last_error": self.rt.last_error,
             "stale_codes": stale_codes[:6],
@@ -2374,6 +2439,7 @@ def _update_web_state(engine: 'WarAdaptiveEngine', holdings: list, all_signals: 
     buy_levels = engine.build_buy_levels_map()
     prev_closes = engine.build_prev_close_map()
     data_health = engine.assess_data_health()
+    code_data_status = engine.assess_code_data_status() if hasattr(engine, "assess_code_data_status") else {}
     hoga_analysis = {code: overlay.get("hoga", {}) for code, overlay in position_overlays.items()}
 
     engine_state.update({
@@ -2392,6 +2458,7 @@ def _update_web_state(engine: 'WarAdaptiveEngine', holdings: list, all_signals: 
         "phase": engine.whipsaw.get_phase(datetime.now()).value,
         "auto_trading": engine.auto_trading_enabled,
         "data_health": data_health,
+        "code_data_status": code_data_status,
         "account_no": engine.api.account_no or "",
         "orderable_cash": orderable_cash,
         "buy_levels": buy_levels,
@@ -2477,6 +2544,7 @@ def _update_web_state_v2(engine: 'WarAdaptiveEngine', holdings: list, all_signal
         "status": "unknown",
         "reason": "준비상태 미확인",
     }
+    code_data_status = engine.assess_code_data_status() if hasattr(engine, "assess_code_data_status") else {}
     hoga_analysis = {code: overlay.get("hoga", {}) for code, overlay in position_overlays.items()}
 
     engine_state.update({
@@ -2496,6 +2564,7 @@ def _update_web_state_v2(engine: 'WarAdaptiveEngine', holdings: list, all_signal
         "auto_trading": engine.auto_trading_enabled,
         "data_health": data_health,
         "data_readiness": data_readiness,
+        "code_data_status": code_data_status,
         "account_no": engine.api.account_no or "",
         "orderable_cash": orderable_cash,
         "buy_levels": buy_levels,
